@@ -17,6 +17,10 @@ The report covers:
 - public replies and internal notes, counted separately
 - every single use, with a view of exactly what the agent changed
 
+Here's the top of a report made from the tool's sample data. Below this part, the full report goes on to list agents, every single use with its changes, and the uses that couldn't be compared. In the report, hover over any underlined label to see what it means.
+
+![The top of a macro edit report. It shows 447 macro uses, 18% sent edited, 82% sent as is, and 83% of agents editing, then lists which macros are edited most often, a breakdown by public reply and internal note, and a table of every macro.](docs/report.png)
+
 It needs Python 3.9 or newer and nothing else. There's nothing to install.
 
 ## Try it without Zendesk

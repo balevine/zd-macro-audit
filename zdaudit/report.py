@@ -13,6 +13,84 @@ from .compare import is_placeholder
 # "often edited" and "usually sent as is" lists.
 MIN_USES = 5
 
+# Hover text for every label in the report, so readers can tell what each number means.
+TIPS = {
+    # Summary tiles
+    "uses": "Every time an agent applied a macro in this period. An update that applied two macros counts as two uses.",
+    "sent_edited": "The share of compared uses where the agent changed the macro's text before saving. "
+                   "Filled-in placeholders and formatting don't count as changes.",
+    "sent_as_is": "The share of compared uses where the saved text matched the macro exactly, apart from "
+                  "placeholders Zendesk filled in.",
+    "agents_editing": "Agents who edited a macro's text at least once, out of all agents with a compared use.",
+    "compared_sub": "Compared uses are the ones the tool could check. Uses of macros with no text, deleted macros, "
+                    "and macros changed since use are left out. See \"Not counted in the percentages\" below.",
+    "kept_avg": "Similarity between the macro and the saved text, averaged over edited uses. 100% would mean no "
+                "change, and 0% means none of the macro's words were kept.",
+    # Ranked lists
+    "edited_often": "Macros with the highest share of edited uses. A macro agents change this often may need rewriting.",
+    "as_is_often": "Macros with the lowest share of edited uses. These work well as written.",
+    # Comment type table
+    "comment_type": "Whether the agent's text went out as a public reply the customer sees, or as an internal "
+                    "note only agents see.",
+    "type_compared": "Uses of this comment type that the tool could check against the macro's text.",
+    "type_edited": "Compared uses of this comment type where the agent changed the macro's text.",
+    "type_as_is": "Compared uses of this comment type where the text matched the macro exactly.",
+    "type_pct": "Edited divided by Compared, for this comment type.",
+    "public_row": "Uses saved with a public reply, which the customer sees.",
+    "internal_row": "Uses saved with an internal note, which only agents see.",
+    "none_row": "The macro added text, but the agent deleted all of it and saved the update with no comment. "
+                "These count as edited.",
+    # Macros table
+    "macro": "The macro's name in Zendesk.",
+    "macro_uses": "How many times agents applied this macro in this period, found in the tickets' history.",
+    "zendesk_count": "Zendesk's own count of this macro's uses in the 30 days before this report was made. "
+                     "It's a check on Uses, and the two should be close. A big gap means the tool missed some uses. "
+                     "It's blank for deleted macros.",
+    "macro_compared": "Uses of this macro that the tool could check. Macros with no text of their own show 0.",
+    "macro_edited": "Compared uses where the agent changed this macro's text.",
+    "macro_pct": "Edited divided by Compared, for this macro.",
+    "kept": "When agents edited this macro, how much of its wording they kept, on average. "
+            "Low numbers mean heavy rewrites.",
+    "public": "Uses of this macro saved with a public reply. This counts every use, including ones that weren't "
+              "compared. Public, Internal and uses with no comment add up to Uses.",
+    "internal": "Uses of this macro saved with an internal note. This counts every use, including ones that "
+                "weren't compared. Public, Internal and uses with no comment add up to Uses.",
+    # Agents table
+    "agent": "The agent who applied the macro.",
+    "agent_uses": "How many macros this agent applied in this period.",
+    "agent_compared": "This agent's uses that the tool could check.",
+    "agent_edited": "Compared uses where this agent changed the macro's text.",
+    "agent_pct": "Edited divided by Compared, for this agent.",
+    # Every macro use
+    "when": "When the update was saved, in UTC.",
+    "use_agent": "The agent who applied the macro and saved the update.",
+    "use_macro": "The macro applied. \"With\" lists other macros applied in the same update.",
+    "use_type": "Public reply, internal note, or no comment if the agent deleted all of the macro's text.",
+    "result": "Whether the agent changed the macro's text. Click an Edited badge to see the changes.",
+    "similarity": "How much of the macro's wording was kept. 100% is unchanged, and 0% means none of it was kept.",
+    "ticket": "The ticket where the macro was used. Click to open it in Zendesk.",
+    # Not counted
+    "reason": "Why these uses couldn't be compared.",
+    "excluded_uses": "How many uses were left out for this reason.",
+    "why": "More detail on the reason.",
+}
+
+BADGE_TIPS = {
+    "unedited": "The saved text matched the macro exactly, apart from placeholders Zendesk filled in.",
+    "edited": "The agent changed the macro's text. Click to see what changed.",
+    **STATUS_HELP,
+}
+
+
+def tip(label: str, key: str) -> str:
+    """A label with hover text. Tabbing to it also shows the text, for keyboard users."""
+    return f'<span class="tip" tabindex="0" data-tip="{escape(TIPS[key])}">{escape(label)}</span>'
+
+
+def th(label: str, key: str, right: bool = False) -> str:
+    cls = ' class="r"' if right else ""
+    return f"<th{cls}>{tip(label, key)}</th>"
+
 
 def write_all(out_dir: Path, result: Result, subdomain: str | None) -> dict[str, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -100,7 +178,7 @@ def _render_diff(ops: list[tuple[str, list[str]]], context: int = 8) -> str:
         if i in filled:
             if op == "insert":
                 title = escape(" ".join(ops[i - 1][1]))
-                parts.append(f'<span class="fill" title="{title}">{escape(" ".join(words))}</span>')
+                parts.append(f'<span class="fill" data-tip="Zendesk filled in {title}">{escape(" ".join(words))}</span>')
             continue
         if op == "equal":
             if len(words) > 2 * context + 3:
@@ -145,30 +223,35 @@ def render_html(result: Result, subdomain: str | None) -> str:
     as_is = [m for m in reversed(ranked) if m not in often][:5]
 
     edited_w = o["pct_edited"] or 0
+    kept_note = ""
+    if o["avg_similarity_edited"] is not None:
+        kept = f"Edited messages kept {o['avg_similarity_edited']:.0f}% of the macro text on average"
+        kept_note = f'<span class="muted">{tip(kept, "kept_avg")}</span>'
     tiles = f"""
     <div class="tiles">
-      <div class="tile"><div class="tv">{o['uses']:,}</div><div class="tl">macro uses</div>
+      <div class="tile"><div class="tv">{o['uses']:,}</div><div class="tl">{tip("macro uses", "uses")}</div>
         <div class="ts">{o['macros_used']:,} different macros</div></div>
-      <div class="tile"><div class="tv edited">{_fmt_pct(o['pct_edited'])}</div><div class="tl">sent edited</div>
-        <div class="ts">{o['edited']:,} of {o['compared']:,} compared uses</div></div>
-      <div class="tile"><div class="tv unedited">{_fmt_pct(o['pct_unedited'])}</div><div class="tl">sent as is</div>
-        <div class="ts">{o['unedited']:,} of {o['compared']:,} compared uses</div></div>
-      <div class="tile"><div class="tv">{_fmt_pct(o['pct_agents_editing'])}</div><div class="tl">of agents edit macros</div>
+      <div class="tile"><div class="tv edited">{_fmt_pct(o['pct_edited'])}</div><div class="tl">{tip("sent edited", "sent_edited")}</div>
+        <div class="ts">{o['edited']:,} of {o['compared']:,} {tip("compared uses", "compared_sub")}</div></div>
+      <div class="tile"><div class="tv unedited">{_fmt_pct(o['pct_unedited'])}</div><div class="tl">{tip("sent as is", "sent_as_is")}</div>
+        <div class="ts">{o['unedited']:,} of {o['compared']:,} {tip("compared uses", "compared_sub")}</div></div>
+      <div class="tile"><div class="tv">{_fmt_pct(o['pct_agents_editing'])}</div><div class="tl">{tip("of agents edit macros", "agents_editing")}</div>
         <div class="ts">{o['agents_editing']:,} of {o['agents_using']:,} agents edited at least once</div></div>
     </div>
     <div class="split" role="img" aria-label="{_fmt_pct(o['pct_edited'])} edited, {_fmt_pct(o['pct_unedited'])} sent as is">
       <span class="s-edited" style="width:{edited_w}%"></span><span class="s-unedited" style="width:{100 - edited_w if o['compared'] else 0}%"></span>
     </div>
     <div class="legend"><span><i class="k-edited"></i>Edited</span><span><i class="k-unedited"></i>Sent as is</span>
-      {f'<span class="muted">Edited messages kept {o["avg_similarity_edited"]:.0f}% of the macro text on average</span>' if o["avg_similarity_edited"] is not None else ''}</div>
+      {kept_note}</div>
     """
 
     type_rows = "".join(
-        f"<tr><td>{label}</td><td class='r'>{t['compared']:,}</td><td class='r'>{t['edited']:,}</td>"
+        f"<tr><td>{tip(label, key)}</td><td class='r'>{t['compared']:,}</td><td class='r'>{t['edited']:,}</td>"
         f"<td class='r'>{t['unedited']:,}</td><td>{_bar(t['pct_edited'])}</td></tr>"
-        for label, t in (("Public replies", o["by_type"]["public"]), ("Internal notes", o["by_type"]["internal"]),
-                         ("No comment (macro text deleted)", o["by_type"]["none"]))
-        if t["compared"] or label != "No comment (macro text deleted)"
+        for label, key, t in (("Public replies", "public_row", o["by_type"]["public"]),
+                              ("Internal notes", "internal_row", o["by_type"]["internal"]),
+                              ("No comment (macro text deleted)", "none_row", o["by_type"]["none"]))
+        if t["compared"] or key != "none_row"
     )
 
     excluded_rows = "".join(
@@ -179,7 +262,7 @@ def render_html(result: Result, subdomain: str | None) -> str:
 
     # Zendesk's usage counts always cover the last 30 days, and need the Professional plan or above.
     has_usage = any(m["zendesk_usage_30d"] is not None for m in result.macros)
-    usage_th = '<th class="r">Zendesk count</th>' if has_usage else ""
+    usage_th = th("Zendesk count", "zendesk_count", right=True) if has_usage else ""
     def usage_cell(m: dict) -> str:
         if not has_usage:
             return ""
@@ -211,7 +294,8 @@ def render_html(result: Result, subdomain: str | None) -> str:
         name = agent_name(result.users, u.agent_id)
         url = ticket_url(subdomain, u.ticket_id)
         ticket = f'<a href="{escape(url)}" target="_blank" rel="noopener">#{u.ticket_id}</a>' if url else f"#{u.ticket_id}"
-        badge = f'<span class="badge b-{u.status}">{escape(STATUS_LABELS[u.status])}</span>'
+        badge = (f'<span class="badge b-{u.status}" data-tip="{escape(BADGE_TIPS[u.status])}">'
+                 f'{escape(STATUS_LABELS[u.status])}</span>')
         if u.diff:
             badge = (f'<details><summary>{badge}</summary>'
                      f'<div class="diff">{_render_diff(u.diff)}</div></details>')
@@ -303,6 +387,11 @@ ins {{ background:var(--ins-bg); color:var(--ins); text-decoration:none; border-
 .ph {{ font-family:ui-monospace, Menlo, monospace; font-size:12px; opacity:0.75; }}
 .gap {{ color:var(--muted); }}
 .fill {{ border-bottom:1px dotted var(--muted); cursor:help; }}
+.tip {{ border-bottom:1px dotted var(--muted); cursor:help; }}
+.tip:focus-visible {{ outline:2px solid var(--accent); outline-offset:2px; border-radius:2px; }}
+#tip {{ position:fixed; z-index:10; display:none; max-width:300px; padding:8px 11px; border-radius:8px;
+  background:var(--text); color:var(--bg); font-size:13px; line-height:1.45; font-weight:400;
+  text-transform:none; letter-spacing:normal; box-shadow:0 4px 16px rgba(0,0,0,0.2); pointer-events:none; }}
 .filters {{ display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; align-items:center; }}
 .filters input, .filters select {{ font:inherit; font-size:14px; padding:7px 10px; border-radius:8px;
   border:1px solid var(--border); background:var(--surface); color:var(--text); }}
@@ -314,34 +403,35 @@ ins {{ background:var(--ins-bg); color:var(--ins); text-decoration:none; border-
 <body>
 <main>
   <h1>Macro edit report</h1>
-  <div class="meta">{escape(account)} · {period} · generated {escape(generated)}</div>
+  <div class="meta">{escape(account)} · {period} · generated {escape(generated)}
+    <div class="sub">Point to any underlined label to see what it means.</div></div>
 
   {tiles}
 
   <h2>Which macros get edited</h2>
   <p class="muted">Macros with at least {MIN_USES} compared uses. Ones that are often edited may need rewriting.</p>
   <div class="cols">
-    <div class="card"><h3>Edited most often</h3>{_macro_list(often, "No macro has been edited yet.")}</div>
-    <div class="card"><h3>Sent as is most often</h3>{_macro_list(as_is, "Not enough uses yet.")}</div>
+    <div class="card"><h3>{tip("Edited most often", "edited_often")}</h3>{_macro_list(often, "No macro has been edited yet.")}</div>
+    <div class="card"><h3>{tip("Sent as is most often", "as_is_often")}</h3>{_macro_list(as_is, "Not enough uses yet.")}</div>
   </div>
 
   <h2>Public replies and internal notes</h2>
   <div class="tablewrap"><table>
-    <thead><tr><th>Comment type</th><th class="r">Compared</th><th class="r">Edited</th><th class="r">Sent as is</th><th>% edited</th></tr></thead>
+    <thead><tr>{th("Comment type", "comment_type")}{th("Compared", "type_compared", True)}{th("Edited", "type_edited", True)}{th("Sent as is", "type_as_is", True)}{th("% edited", "type_pct")}</tr></thead>
     <tbody>{type_rows}</tbody>
   </table></div>
 
   <h2>Macros</h2>
   <p class="muted">Every macro used in this period, most used first. "Kept when edited" is how much of the macro's text survived, on average, when an agent changed it.{usage_note}</p>
   <div class="tablewrap"><table>
-    <thead><tr><th>Macro</th><th class="r">Uses</th>{usage_th}<th class="r">Compared</th><th class="r">Edited</th><th>% edited</th>
-      <th class="r">Kept when edited</th><th class="r">Public</th><th class="r">Internal</th></tr></thead>
+    <thead><tr>{th("Macro", "macro")}{th("Uses", "macro_uses", True)}{usage_th}{th("Compared", "macro_compared", True)}{th("Edited", "macro_edited", True)}{th("% edited", "macro_pct")}
+      {th("Kept when edited", "kept", True)}{th("Public", "public", True)}{th("Internal", "internal", True)}</tr></thead>
     <tbody>{macro_rows}</tbody>
   </table></div>
 
   <h2>Agents</h2>
   <div class="tablewrap"><table>
-    <thead><tr><th>Agent</th><th class="r">Uses</th><th class="r">Compared</th><th class="r">Edited</th><th>% edited</th></tr></thead>
+    <thead><tr>{th("Agent", "agent")}{th("Uses", "agent_uses", True)}{th("Compared", "agent_compared", True)}{th("Edited", "agent_edited", True)}{th("% edited", "agent_pct")}</tr></thead>
     <tbody>{agent_rows}</tbody>
   </table></div>
 
@@ -355,13 +445,13 @@ ins {{ background:var(--ins-bg); color:var(--ins); text-decoration:none; border-
     <span id="count"></span>
   </div>
   <div class="tablewrap"><table id="uses">
-    <thead><tr><th>When (UTC)</th><th>Agent</th><th>Macro</th><th>Type</th><th>Result</th><th class="r">Similarity</th><th>Ticket</th></tr></thead>
+    <thead><tr>{th("When (UTC)", "when")}{th("Agent", "use_agent")}{th("Macro", "use_macro")}{th("Type", "use_type")}{th("Result", "result")}{th("Similarity", "similarity", True)}{th("Ticket", "ticket")}</tr></thead>
     <tbody>{''.join(use_rows)}</tbody>
   </table></div>
 
   <h2>Not counted in the percentages</h2>
   <div class="tablewrap"><table>
-    <thead><tr><th>Reason</th><th class="r">Uses</th><th>Why</th></tr></thead>
+    <thead><tr>{th("Reason", "reason")}{th("Uses", "excluded_uses", True)}{th("Why", "why")}</tr></thead>
     <tbody>{excluded_rows}</tbody>
   </table></div>
 
@@ -375,7 +465,36 @@ ins {{ background:var(--ins-bg); color:var(--ins); text-decoration:none; border-
     <li>Zendesk only returns a macro's current text. If a macro changed during this period, older uses that don't match are listed as "Macro changed since use" instead of being counted.</li>
   </ul>
 </main>
+<div id="tip" role="tooltip"></div>
 <script>
+(function () {{
+  // One floating tooltip for every [data-tip] label. It's positioned against the
+  // window, so the scrolling table boxes can't cut it off.
+  var tipEl = document.getElementById('tip'), current = null;
+  function show(el) {{
+    if (current) current.removeAttribute('aria-describedby');
+    current = el;
+    el.setAttribute('aria-describedby', 'tip');
+    tipEl.textContent = el.getAttribute('data-tip');
+    tipEl.style.display = 'block';
+    var r = el.getBoundingClientRect(), w = tipEl.offsetWidth, h = tipEl.offsetHeight;
+    var left = Math.min(Math.max(8, r.left + r.width / 2 - w / 2), window.innerWidth - w - 8);
+    var top = r.bottom + 8 + h > window.innerHeight - 8 ? r.top - h - 8 : r.bottom + 8;
+    tipEl.style.left = left + 'px';
+    tipEl.style.top = top + 'px';
+  }}
+  function hide() {{
+    if (current) current.removeAttribute('aria-describedby');
+    current = null;
+    tipEl.style.display = 'none';
+  }}
+  function target(e) {{ return e.target.closest ? e.target.closest('[data-tip]') : null; }}
+  document.addEventListener('mouseover', function (e) {{ var el = target(e); if (el) show(el); else if (current) hide(); }});
+  document.addEventListener('focusin', function (e) {{ var el = target(e); if (el) show(el); }});
+  document.addEventListener('focusout', hide);
+  document.addEventListener('keydown', function (e) {{ if (e.key === 'Escape') hide(); }});
+  window.addEventListener('scroll', hide, true);
+}})();
 (function () {{
   var q = document.getElementById('q'), st = document.getElementById('status'),
       ty = document.getElementById('type'), count = document.getElementById('count'),
