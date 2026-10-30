@@ -169,3 +169,7 @@ Some uses can't be judged, so they're left out of the percentages and listed sep
 | `zdaudit/report.py` | Writes the HTML report and CSV files. |
 | `zdaudit/sample.py` | The made-up data behind `--sample`. |
 | `tests/` | Tests. Run them with `python3 -m unittest`. |
+
+## License
+
+This project uses the MIT License. See [LICENSE](LICENSE).
