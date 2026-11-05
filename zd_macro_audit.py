@@ -91,7 +91,7 @@ def print_summary(result: analyze.Result, paths: dict[str, Path]) -> None:
     print(f"\nMacro uses found:     {o['uses']:,} ({o['macros_used']:,} macros)")
     print(f"Compared:             {o['compared']:,}")
     print(f"Sent edited:          {o['edited']:,} ({fmt(o['pct_edited'])})")
-    print(f"Sent as is:           {o['unedited']:,} ({fmt(o['pct_unedited'])})")
+    print(f"Kept intact:          {o['unedited']:,} ({fmt(o['pct_unedited'])}), {o['added_text']:,} with text added around it")
     print(f"Agents who edit:      {o['agents_editing']:,} of {o['agents_using']:,} ({fmt(o['pct_agents_editing'])})")
     for kind, label in (("public", "Public"), ("internal", "Internal"), ("none", "No comment")):
         t = o["by_type"][kind]

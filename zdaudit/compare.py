@@ -1,7 +1,7 @@
 """Compare the text an agent sent with the text a macro inserts.
 
-A use counts as unedited only when the sent comment equals the macro text.
-Differences in whitespace, formatting marks (bold, links, list bullets) and
+A use counts as unedited when the macro text appears intact anywhere in the sent
+comment, whatever the agent wrote around it. Differences in whitespace, formatting marks (bold, links, list bullets) and
 curly versus straight quotes are ignored. Placeholders such as
 {{ticket.requester.first_name}} match any text, because Zendesk fills them in
 before it saves the comment. Dynamic content placeholders ({{dc.name}}) match
@@ -134,22 +134,34 @@ def is_placeholder(word: str) -> bool:
 
 def build_template(text: str, dynamic: dict[str, list[str]] | None = None) -> Template:
     source, literal, display = _parse(text, dynamic or {})
-    return Template(re.compile(source, re.S), literal, display)
+    # The boundaries stop "Thanks" from matching inside "Thanksgiving".
+    return Template(re.compile(rf"(?<!\w)(?:{source})(?!\w)", re.S), literal, display)
 
 
 @dataclass
 class Comparison:
-    matched: bool
-    similarity: float  # 0 to 100, where 100 means the macro text was sent as is
+    matched: bool      # every macro's text appears intact in the sent comment
+    similarity: float  # 0 to 100, the share of the macro's words kept, where 100 means all of them
     template: Template
+    added_text: bool = False  # matched, and the agent also wrote text around the macro
+
+
+def _words_kept(macro_words: list[str], sent_words: list[str]) -> float:
+    """Share of the macro's words kept in order. Text the agent added doesn't lower it."""
+    if not macro_words:
+        return 0.0
+    matcher = SequenceMatcher(None, macro_words, sent_words, autojunk=False)
+    return sum(block.size for block in matcher.get_matching_blocks()) / len(macro_words)
 
 
 def compare(macro_texts: list[str], sent: str, dynamic: dict[str, list[str]] | None = None) -> Comparison:
     """Compare sent text against one or more macro texts applied in the same update.
 
-    When several macros were applied, their texts may appear in any order, so
-    each order is tried (up to three macros).
+    When several macros were applied, each one's text must appear intact, in
+    any order. For a comment that is nothing but macro text, or for scoring an
+    edit, their texts are joined in each order (up to three macros).
     """
+    macro_texts = list(dict.fromkeys(macro_texts))  # a macro applied twice only needs to appear once
     sent_norm = normalize(sent)
     sent_words = sent_norm.split()
     orders = itertools.permutations(macro_texts) if len(macro_texts) <= 3 else [macro_texts]
@@ -158,11 +170,12 @@ def compare(macro_texts: list[str], sent: str, dynamic: dict[str, list[str]] | N
         template = build_template("\n\n".join(order), dynamic)
         if template.pattern.fullmatch(sent_norm):
             return Comparison(True, 100.0, template)
-        ratio = SequenceMatcher(None, template.literal_words, sent_words, autojunk=False).ratio()
-        score = min(round(ratio * 100, 1), 99.9)
+        score = min(round(_words_kept(template.literal_words, sent_words) * 100, 1), 99.9)
         if best is None or score > best.similarity:
             best = Comparison(False, score, template)
     assert best is not None
+    if all(build_template(text, dynamic).pattern.search(sent_norm) for text in macro_texts):
+        return Comparison(True, 100.0, best.template, added_text=True)
     return best
 
 

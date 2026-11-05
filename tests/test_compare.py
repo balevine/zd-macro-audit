@@ -42,8 +42,32 @@ class CompareTests(unittest.TestCase):
     def test_one_word_change_is_an_edit(self):
         self.assertEdited(GREETING, "Hi Priya,\n\nThanks for writing in. We fixed this.")
 
-    def test_added_text_is_an_edit(self):
-        self.assertEdited(GREETING, "Hi Priya,\n\nThanks for writing in. We fixed it. Have a great day!")
+    def test_text_added_around_macro_is_not_an_edit(self):
+        macro = "Thanks for writing in. We fixed it."
+        for sent in ("Hi Priya,\n\nThanks for writing in. We fixed it.",
+                     "Thanks for writing in. We fixed it.\n\nSam\nAcme Support",
+                     "Hi Priya,\n\nThanks for writing in. We fixed it.\n\nSam"):
+            self.assertUnedited(macro, sent)
+            self.assertTrue(compare([macro], sent).added_text)
+        self.assertUnedited(GREETING, "Good news!\n\nHi Priya,\n\nThanks for writing in. We fixed it.\n\nSam")
+
+    def test_macro_alone_has_no_added_text(self):
+        self.assertFalse(compare([GREETING], "Hi Priya,\n\nThanks for writing in. We fixed it.").added_text)
+        macro = "Thanks.{% if ticket.priority == 'urgent' %} We'll call you today.{% endif %}"
+        self.assertFalse(compare([macro], "Thanks. We'll call you today.").added_text)
+
+    def test_change_inside_macro_with_added_text_is_an_edit(self):
+        result = compare([GREETING], "Hello!\n\nHi Priya,\n\nThanks for writing in. We fixed this.\n\nSam")
+        self.assertFalse(result.matched)
+        # The added text doesn't lower the score.
+        alone = compare([GREETING], "Hi Priya,\n\nThanks for writing in. We fixed this.")
+        self.assertEqual(result.similarity, alone.similarity)
+
+    def test_text_added_inside_macro_is_an_edit(self):
+        self.assertEdited("Thanks for writing in. We fixed it.", "Thanks for writing in. Sorry! We fixed it.")
+
+    def test_macro_must_match_whole_words(self):
+        self.assertEdited("Thanks", "Thanksgiving hours are posted.")
 
     def test_case_change_is_an_edit(self):
         self.assertEdited(GREETING, "Hi Priya,\n\nthanks for writing in. We fixed it.")
@@ -61,6 +85,17 @@ class CompareTests(unittest.TestCase):
 
     def test_multiple_macros_any_order(self):
         self.assertUnedited(["First part.", "Second part."], "Second part.\n\nFirst part.")
+
+    def test_multiple_macros_with_text_between(self):
+        macros = ["First part.", "Second part."]
+        self.assertUnedited(macros, "Hi!\n\nSecond part.\n\nAlso, one more thing.\n\nFirst part.\n\nSam")
+        self.assertEdited(macros, "Hi!\n\nFirst part.\n\nSam")
+
+    def test_more_than_three_macros(self):
+        self.assertUnedited(["A one.", "B two.", "C three.", "D four."], "D four. A one. B two. C three.")
+
+    def test_same_macro_applied_twice(self):
+        self.assertUnedited([GREETING, GREETING], "Hi Priya,\n\nThanks for writing in. We fixed it.")
 
     def test_similarity_reflects_size_of_edit(self):
         small = compare([GREETING], "Hi Priya, Thanks for writing in. We fixed this.").similarity

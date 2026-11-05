@@ -11,9 +11,9 @@ It looks at the last 30 days of ticket updates in your Zendesk account. Every ti
 
 The report covers:
 
-- the percentage of macro uses sent edited and sent as is
+- the percentage of macro uses sent edited and kept intact
 - the share of agents who edit macros
-- which macros are edited most often, and which are usually sent as is
+- which macros are edited most often, and which are usually kept intact
 - public replies and internal notes, counted separately
 - every single use, with a view of exactly what the agent changed
 
@@ -130,18 +130,22 @@ Zendesk's usage count is a check on the tool. In the report's macro table, "Zend
 
 ## How "edited" is decided
 
-A use counts as **sent as is** only when the saved comment matches the macro's text exactly, with these exceptions.
+A use counts as **kept intact** when the macro's text appears unchanged anywhere in the saved comment. Agents often use a macro as part of a longer reply, so a greeting, signature or anything else added before or after it isn't an edit. These uses are marked "with text added" in the report, and `text_added` in `macro_uses.csv`.
+
+"Unchanged" allows for these exceptions.
 
 - **Placeholders** like `{{ticket.requester.first_name}}` match whatever Zendesk filled in. Filling in a name is never an edit.
 - **Dynamic content** like `{{dc.sign_off}}` matches any of its language versions.
 - **Liquid blocks** like `{% if %}...{% endif %}` match whether or not their text appears.
 - **Spacing, bold, links, list bullets and curly quotes** are ignored, because the editor changes these on its own.
 
-Every other change counts as an edit, however small. Each use also gets a **similarity score**. 100% means sent as is. A fixed typo scores in the high 90s, and a full rewrite scores much lower. The score shows how much of the macro's wording the agent kept.
+Every other change inside the macro's text counts as an edit, however small, including text added in the middle of it. Each use also gets a **similarity score**, which shows how much of the macro's wording the agent kept. 100% means it was kept intact. A fixed typo scores in the high 90s, and a full rewrite scores much lower. Text added around the macro doesn't lower the score.
+
+Text added right next to a placeholder can't be told apart from what Zendesk filled in, so it doesn't count as an edit.
 
 If a macro adds text but the agent saved the update with no comment, they deleted all of the macro's text. That counts as edited, with 0% similarity. The report lists these uses as "No comment".
 
-If an agent applied several macros in one update, the comment is compared with all of their text together, in any order. Each macro counts as one use.
+If an agent applied several macros in one update, all of their text must appear intact, in any order, for any of them to count as kept intact. Each macro counts as one use.
 
 ### Uses that aren't counted
 

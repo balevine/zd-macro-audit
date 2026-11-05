@@ -10,7 +10,7 @@ from .analyze import STATUS_HELP, STATUS_LABELS, Result, agent_name
 from .compare import is_placeholder
 
 # A macro needs at least this many compared uses to appear in the
-# "often edited" and "usually sent as is" lists.
+# "often edited" and "usually kept intact" lists.
 MIN_USES = 5
 
 # Hover text for every label in the report, so readers can tell what each number means.
@@ -18,9 +18,9 @@ TIPS = {
     # Summary tiles
     "uses": "Every time an agent applied a macro in this period. An update that applied two macros counts as two uses.",
     "sent_edited": "The share of compared uses where the agent changed the macro's text before saving. "
-                   "Filled-in placeholders and formatting don't count as changes.",
-    "sent_as_is": "The share of compared uses where the saved text matched the macro exactly, apart from "
-                  "placeholders Zendesk filled in.",
+                   "Filled-in placeholders, formatting and text added around the macro don't count as changes.",
+    "sent_as_is": "The share of compared uses where the macro's text appears unchanged in the saved text, apart "
+                  "from placeholders Zendesk filled in. The agent may have written more around it.",
     "agents_editing": "Agents who edited a macro's text at least once, out of all agents with a compared use.",
     "compared_sub": "Compared uses are the ones the tool could check. Uses of macros with no text, deleted macros, "
                     "and macros changed since use are left out. See \"Not counted in the percentages\" below.",
@@ -34,7 +34,7 @@ TIPS = {
                     "note only agents see.",
     "type_compared": "Uses of this comment type that the tool could check against the macro's text.",
     "type_edited": "Compared uses of this comment type where the agent changed the macro's text.",
-    "type_as_is": "Compared uses of this comment type where the text matched the macro exactly.",
+    "type_as_is": "Compared uses of this comment type where the macro's text appears unchanged, with or without added text.",
     "type_pct": "Edited divided by Compared, for this comment type.",
     "public_row": "Uses saved with a public reply, which the customer sees.",
     "internal_row": "Uses saved with an internal note, which only agents see.",
@@ -76,7 +76,7 @@ TIPS = {
 }
 
 BADGE_TIPS = {
-    "unedited": "The saved text matched the macro exactly, apart from placeholders Zendesk filled in.",
+    "unedited": "The macro's text appears unchanged in the saved text, apart from placeholders Zendesk filled in.",
     "edited": "The agent changed the macro's text. Click to see what changed.",
     **STATUS_HELP,
 }
@@ -123,17 +123,18 @@ def _write_uses_csv(path: Path, result: Result, subdomain: str | None) -> None:
         writer = csv.writer(f)
         writer.writerow([
             "used_at_utc", "ticket_id", "ticket_url", "agent_id", "agent_name", "agent_email",
-            "macro_id", "macro_title", "comment_type", "status", "edited", "similarity_pct",
+            "macro_id", "macro_title", "comment_type", "status", "edited", "text_added", "similarity_pct",
             "combined_with", "audit_id",
         ])
         for u in result.uses:
             edited = {"edited": "yes", "unedited": "no"}.get(u.status, "")
+            text_added = ("yes" if u.added_text else "no") if u.status == "unedited" else ""
             writer.writerow([
                 u.created_at.strftime("%Y-%m-%d %H:%M:%S"), u.ticket_id,
                 ticket_url(subdomain, u.ticket_id), u.agent_id,
                 agent_name(result.users, u.agent_id),
                 result.users.get(u.agent_id, {}).get("email", ""),
-                u.macro_id, u.macro_title, u.comment_type, u.status, edited,
+                u.macro_id, u.macro_title, u.comment_type, u.status, edited, text_added,
                 "" if u.similarity is None else u.similarity,
                 " | ".join(u.combined_with), u.audit_id,
             ])
@@ -233,15 +234,15 @@ def render_html(result: Result, subdomain: str | None) -> str:
         <div class="ts">{o['macros_used']:,} different macros</div></div>
       <div class="tile"><div class="tv edited">{_fmt_pct(o['pct_edited'])}</div><div class="tl">{tip("sent edited", "sent_edited")}</div>
         <div class="ts">{o['edited']:,} of {o['compared']:,} {tip("compared uses", "compared_sub")}</div></div>
-      <div class="tile"><div class="tv unedited">{_fmt_pct(o['pct_unedited'])}</div><div class="tl">{tip("sent as is", "sent_as_is")}</div>
-        <div class="ts">{o['unedited']:,} of {o['compared']:,} {tip("compared uses", "compared_sub")}</div></div>
+      <div class="tile"><div class="tv unedited">{_fmt_pct(o['pct_unedited'])}</div><div class="tl">{tip("kept intact", "sent_as_is")}</div>
+        <div class="ts">{o['unedited']:,} of {o['compared']:,} {tip("compared uses", "compared_sub")}, {o['added_text']:,} with text added</div></div>
       <div class="tile"><div class="tv">{_fmt_pct(o['pct_agents_editing'])}</div><div class="tl">{tip("of agents edit macros", "agents_editing")}</div>
         <div class="ts">{o['agents_editing']:,} of {o['agents_using']:,} agents edited at least once</div></div>
     </div>
-    <div class="split" role="img" aria-label="{_fmt_pct(o['pct_edited'])} edited, {_fmt_pct(o['pct_unedited'])} sent as is">
+    <div class="split" role="img" aria-label="{_fmt_pct(o['pct_edited'])} edited, {_fmt_pct(o['pct_unedited'])} kept intact">
       <span class="s-edited" style="width:{edited_w}%"></span><span class="s-unedited" style="width:{100 - edited_w if o['compared'] else 0}%"></span>
     </div>
-    <div class="legend"><span><i class="k-edited"></i>Edited</span><span><i class="k-unedited"></i>Sent as is</span>
+    <div class="legend"><span><i class="k-edited"></i>Edited</span><span><i class="k-unedited"></i>Kept intact</span>
       {kept_note}</div>
     """
 
@@ -299,6 +300,8 @@ def render_html(result: Result, subdomain: str | None) -> str:
         if u.diff:
             badge = (f'<details><summary>{badge}</summary>'
                      f'<div class="diff">{_render_diff(u.diff)}</div></details>')
+        elif u.added_text:
+            badge += "<div class='sub'>with text added</div>"
         combined = (f"<div class='sub'>with {escape(', '.join(u.combined_with))}</div>"
                     if u.combined_with else "")
         kind = {"public": "Public", "internal": "Internal"}.get(u.comment_type, "No comment")
@@ -412,12 +415,12 @@ ins {{ background:var(--ins-bg); color:var(--ins); text-decoration:none; border-
   <p class="muted">Macros with at least {MIN_USES} compared uses. Ones that are often edited may need rewriting.</p>
   <div class="cols">
     <div class="card"><h3>{tip("Edited most often", "edited_often")}</h3>{_macro_list(often, "No macro has been edited yet.")}</div>
-    <div class="card"><h3>{tip("Sent as is most often", "as_is_often")}</h3>{_macro_list(as_is, "Not enough uses yet.")}</div>
+    <div class="card"><h3>{tip("Kept intact most often", "as_is_often")}</h3>{_macro_list(as_is, "Not enough uses yet.")}</div>
   </div>
 
   <h2>Public replies and internal notes</h2>
   <div class="tablewrap"><table>
-    <thead><tr>{th("Comment type", "comment_type")}{th("Compared", "type_compared", True)}{th("Edited", "type_edited", True)}{th("Sent as is", "type_as_is", True)}{th("% edited", "type_pct")}</tr></thead>
+    <thead><tr>{th("Comment type", "comment_type")}{th("Compared", "type_compared", True)}{th("Edited", "type_edited", True)}{th("Kept intact", "type_as_is", True)}{th("% edited", "type_pct")}</tr></thead>
     <tbody>{type_rows}</tbody>
   </table></div>
 
@@ -459,9 +462,10 @@ ins {{ background:var(--ins-bg); color:var(--ins); text-decoration:none; border-
   <ul class="notes muted">
     <li>A macro use is any update where Zendesk recorded that an agent applied a macro. The text saved in that same update is compared with the macro's comment text.</li>
     <li>Placeholders such as <code>{{{{ticket.requester.first_name}}}}</code> match whatever Zendesk filled in, so they never count as edits. Dynamic content matches any of its language versions.</li>
-    <li>Changes to spacing, bold, links, list bullets and curly quotes are ignored. Every other change counts as an edit, however small. Similarity shows how much of the macro's wording was kept.</li>
+    <li>A use counts as kept intact when the macro's text appears anywhere in the saved text, so a greeting or signature added around it isn't an edit. These uses are marked "with text added".</li>
+    <li>Changes to spacing, bold, links, list bullets and curly quotes are ignored. Any other change inside the macro's text counts as an edit, however small. Similarity shows how much of the macro's wording was kept.</li>
     <li>If a macro adds text but the update was saved with no comment, the agent deleted all of the macro's text. That counts as edited, with 0% similarity.</li>
-    <li>If several macros were applied in one update, the text is compared with all of them together, and each macro is counted as a use.</li>
+    <li>If several macros were applied in one update, all of their text must be intact for any of them to count as kept intact. Each macro is counted as a use.</li>
     <li>Zendesk only returns a macro's current text. If a macro changed during this period, older uses that don't match are listed as "Macro changed since use" instead of being counted.</li>
   </ul>
 </main>

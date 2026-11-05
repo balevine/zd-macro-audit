@@ -13,7 +13,7 @@ from .zendesk import is_macro_event, parse_time
 COUNTED = ("edited", "unedited")
 
 STATUS_LABELS = {
-    "unedited": "Sent as is",
+    "unedited": "Kept intact",
     "edited": "Edited",
     "no_text": "Macro has no comment text",
     "unavailable": "Macro deleted or unreadable",
@@ -41,6 +41,7 @@ class Use:
     similarity: float | None
     combined_with: list[str] = field(default_factory=list)
     diff: list[tuple[str, list[str]]] | None = None
+    added_text: bool = False     # kept intact, with the agent's own text around it
 
 
 @dataclass
@@ -142,6 +143,7 @@ def analyze(audits: list[dict], macros: dict[str, dict], users: dict[str, dict],
                 similarity=comparison.similarity if has_score else None,
                 combined_with=[titles[o] for o in ref_ids if o != mid],
                 diff=diff if status in ("edited", "changed") else None,
+                added_text=status == "unedited" and comparison.added_text,
             ))
 
     return Result(since, until, uses, users, _overall(uses), _by_agent(uses, users), _by_macro(uses, macros))
@@ -168,6 +170,7 @@ def _overall(uses: list[Use]) -> dict:
         "compared": len(counted),
         "edited": len(edited),
         "unedited": len(counted) - len(edited),
+        "added_text": sum(u.added_text for u in counted),
         "pct_edited": pct(len(edited), len(counted)),
         "pct_unedited": pct(len(counted) - len(edited), len(counted)),
         "excluded": Counter(u.status for u in uses if u.status not in COUNTED),
