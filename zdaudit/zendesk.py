@@ -33,8 +33,8 @@ REDIRECT_URI = f"http://localhost:{REDIRECT_PORT}/callback"
 SCOPE = "read"
 USER_AGENT = "zd-macro-audit/1.0"
 
-# Zendesk's audit events reference names this event "MacroReference", but
-# "AgentMacroReference" has also been seen in API responses, so accept both.
+# Zendesk's audit events reference names this event "MacroReference", but its
+# example and real responses can say "AgentMacroReference", so accept both.
 MACRO_EVENT_TYPES = ("MacroReference", "AgentMacroReference")
 
 
@@ -53,7 +53,7 @@ def parse_time(value: str) -> datetime:
 
 
 def is_macro_event(event: dict) -> bool:
-    return event.get("type") in MACRO_EVENT_TYPES
+    return event.get("type") in MACRO_EVENT_TYPES and event.get("macro_id") is not None
 
 
 def _pkce_pair() -> tuple[str, str]:
@@ -115,7 +115,6 @@ def _wait_for_redirect(expected_state: str, timeout: int = 300) -> dict[str, str
 class Zendesk:
     def __init__(self, subdomain: str, client_id: str = "", client_secret: str = "",
                  token_dir: Path = Path(".tokens"), email: str = "", api_token: str = ""):
-        self.subdomain = subdomain
         self.client_id = client_id
         self.client_secret = client_secret
         self.email = email
@@ -140,11 +139,14 @@ class Zendesk:
             self.login()
             return
         try:
-            me = self.get("/api/v2/users/me.json")["user"]
+            me = self._me()
         except AuthError:
             self.login()
-            me = self.get("/api/v2/users/me.json")["user"]
+            me = self._me()
         self._check_role(me)
+
+    def _me(self) -> dict:
+        return self.get("/api/v2/users/me.json")["user"]
 
     def login(self) -> None:
         verifier, challenge = _pkce_pair()
@@ -172,25 +174,20 @@ class Zendesk:
         if reply.get("state") != state:
             raise AuthError("The sign-in reply didn't match this request. Please try again.")
 
-        payload = {
+        self._save_token(self._post_token({
             "grant_type": "authorization_code",
             "code": reply["code"],
-            "client_id": self.client_id,
             "redirect_uri": REDIRECT_URI,
-            "scope": SCOPE,
             "code_verifier": verifier,
-        }
-        if self.client_secret:
-            payload["client_secret"] = self.client_secret
-        self._save_token(self._post_token(payload))
-        me = self.get("/api/v2/users/me.json")["user"]
+        }))
+        me = self._me()
         print(f"Signed in as {me.get('name')} ({me.get('email')}).")
         self._check_role(me)
 
     def _token_login(self) -> None:
         """Check the API token works. There's nothing to save, since it doesn't expire."""
         try:
-            me = self.get("/api/v2/users/me.json")["user"]
+            me = self._me()
         except AuthError:
             raise AuthError(
                 f"Zendesk didn't accept the API token for {self.email}. Check the email and "
@@ -224,21 +221,16 @@ class Zendesk:
             refresh_token = self.token.get("refresh_token")
             if not refresh_token:
                 return False
-            payload = {
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-                "client_id": self.client_id,
-                "scope": SCOPE,
-            }
-            if self.client_secret:
-                payload["client_secret"] = self.client_secret
             try:
-                self._save_token(self._post_token(payload))
+                self._save_token(self._post_token({"grant_type": "refresh_token", "refresh_token": refresh_token}))
                 return True
             except AuthError:
                 return False
 
     def _post_token(self, payload: dict) -> dict:
+        payload = {**payload, "client_id": self.client_id, "scope": SCOPE}
+        if self.client_secret:
+            payload["client_secret"] = self.client_secret
         request = urllib.request.Request(
             f"{self.base}/oauth/tokens",
             data=json.dumps(payload).encode(),
@@ -374,7 +366,7 @@ def fetch_macro_audits(zd: Zendesk, since: datetime, log: Callable[[str], None],
     return audits
 
 
-def fetch_macros(zd: Zendesk, wanted: Iterable[str]) -> dict[str, dict]:
+def fetch_macros(zd: Zendesk, wanted: Iterable[str], log: Callable[[str], None]) -> dict[str, dict]:
     """The macros that were used, with Zendesk's own 30-day usage count when the plan allows it."""
     wanted = set(wanted)
     path = "/api/v2/macros.json?page%5Bsize%5D=100"
@@ -383,7 +375,7 @@ def fetch_macros(zd: Zendesk, wanted: Iterable[str]) -> dict[str, dict]:
     except ZendeskError as exc:
         if exc.status is None or exc.status >= 500:
             raise
-        print("  Zendesk's macro usage counts aren't available on this plan. Skipping that check.")
+        log("  Zendesk's macro usage counts aren't available on this plan. Skipping that check.")
         listed = list(zd.paginate(path, "macros"))
     macros = {str(m["id"]): m for m in listed if str(m["id"]) in wanted}
     # Macros deleted since they were used won't be in the list. Try each one directly.
@@ -396,7 +388,7 @@ def fetch_macros(zd: Zendesk, wanted: Iterable[str]) -> dict[str, dict]:
     return macros
 
 
-def fetch_dynamic_content(zd: Zendesk) -> dict[str, list[str]]:
+def fetch_dynamic_content(zd: Zendesk, log: Callable[[str], None]) -> dict[str, list[str]]:
     """Map 'dc.name' to the text of each variant, default variant first."""
     items: dict[str, list[str]] = {}
     try:
@@ -409,7 +401,7 @@ def fetch_dynamic_content(zd: Zendesk) -> dict[str, list[str]]:
             if key and variants:
                 items[key] = [v["content"] for v in variants]
     except ZendeskError as exc:
-        print(f"  Couldn't read dynamic content ({exc.status}). {{{{dc.*}}}} placeholders will match any text.")
+        log(f"  Couldn't read dynamic content ({exc.status}). {{{{dc.*}}}} placeholders will match any text.")
     return items
 
 
@@ -426,17 +418,13 @@ def fetch_users(zd: Zendesk, ids: Iterable[str]) -> dict[str, dict]:
 def fetch_all(zd: Zendesk, since: datetime, log: Callable[[str], None] = print, workers: int = 4) -> dict:
     log("Finding tickets updated in this period...")
     audits = fetch_macro_audits(zd, since, log, workers)
-    macro_ids = {
-        str(e["macro_id"])
-        for a in audits for e in a["events"]
-        if is_macro_event(e) and e.get("macro_id") is not None
-    }
+    macro_ids = {str(e["macro_id"]) for a in audits for e in a["events"] if is_macro_event(e)}
     log(f"Fetching {len(macro_ids):,} macros...")
-    macros = fetch_macros(zd, macro_ids)
+    macros = fetch_macros(zd, macro_ids, log)
     dynamic: dict[str, list[str]] = {}
     if any(re.search(r"\{\{-?\s*dc\.", json.dumps(m.get("actions", []))) for m in macros.values()):
         log("Fetching dynamic content used in macros...")
-        dynamic = fetch_dynamic_content(zd)
+        dynamic = fetch_dynamic_content(zd, log)
     log("Fetching agent names...")
     users = fetch_users(zd, (a["author_id"] for a in audits))
     return {"audits": audits, "macros": macros, "users": users, "dynamic": dynamic}

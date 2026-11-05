@@ -101,7 +101,7 @@ def html_to_text(markup: str) -> str:
     return "".join(parser.parts)
 
 
-def normalize(text: str) -> str:
+def _normalize(text: str) -> str:
     text = html.unescape(text).translate(_CHAR_MAP)
     text = _MD_ESCAPE.sub(r"\1", text)
     text = _MD_IMAGE.sub("", text)
@@ -122,7 +122,7 @@ def _is_word(token: str) -> bool:
 
 class _Comment:
     def __init__(self, sent: str):
-        self.text = normalize(sent)
+        self.text = _normalize(sent)
         found = list(_TOKEN.finditer(self.text))
         self.tokens = tuple(m.group(0) for m in found)
         self.spans = [m.span() for m in found]
@@ -179,69 +179,7 @@ def _sequence_ends(parts: list, comment: _Comment, start: int) -> set[int]:
     ends = {start}
     for part in parts:
         ends = {after for end in ends for after in part.ends(comment, end)}
-        if not ends:
-            break
     return ends
-
-
-def _required_words(parts: list) -> int:
-    """How many fixed words must appear, whichever options are taken."""
-    total = 0
-    for part in parts:
-        if isinstance(part, _Literal):
-            total += sum(_is_word(t) for t in part.tokens)
-        elif isinstance(part, _Choice):
-            total += min(_required_words(option) for option in part.options)
-    return total
-
-
-def _outline(parts: list, available: set[str]) -> list:
-    """The macro as fixed words and gap sizes, taking the option closest to what was sent."""
-    outline: list = []
-    for part in parts:
-        if isinstance(part, _Literal):
-            outline.extend(t for t in part.tokens if _is_word(t))
-        elif isinstance(part, _Gap):
-            outline.append(part.max_words)
-        else:
-            options = [_outline(option, available) for option in part.options]
-            outline.extend(max(options, key=lambda o: (
-                sum(item in available for item in o if isinstance(item, str)),
-                -sum(isinstance(item, str) for item in o),
-            )))
-    return outline
-
-
-def _pct_edited(outline: list, sent_words: list[str]) -> tuple[float, list[tuple[int, int]]]:
-    """How much of a macro was edited, and which runs of sent words matched it (start, length).
-
-    A replaced stretch counts as its longer side. Words inserted where a
-    placeholder sits only count beyond what the placeholder can fill. Words
-    before the macro's first match or after its last are text added around it,
-    so they don't count.
-    """
-    words: list[str] = []
-    free: dict[int, int] = {}   # position in words -> how many words a gap there can fill
-    for item in outline:
-        if isinstance(item, str):
-            words.append(item)
-        else:
-            free[len(words)] = free.get(len(words), 0) + item
-    if not words:
-        return 100.0, []
-    matcher = SequenceMatcher(None, words, sent_words, autojunk=False)
-    changed = 0
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        if tag == "equal":
-            continue
-        if i1 == 0 or i2 == len(words):
-            changed += i2 - i1
-        else:
-            allowed = sum(free.get(i, 0) for i in range(i1, i2 + 1))
-            changed += max(i2 - i1, j2 - j1 - allowed)
-    # An edited macro never reads 0%, even if only its punctuation changed.
-    pct = min(max(round(100 * changed / len(words), 1), 0.1), 100.0)
-    return pct, [(block.b, block.size) for block in matcher.get_matching_blocks() if block.size]
 
 
 # ---- Reading a macro's text ----------------------------------------------------
@@ -265,8 +203,7 @@ def _parse_tree(text: str) -> list:
     stack: list[tuple[_Block, list]] = []
     position = 0
     for match in _TAG.finditer(text):
-        if match.start() > position:
-            current.append(text[position:match.start()])
+        current.append(text[position:match.start()])
         position = match.end()
         source = match.group(0)
         if source.startswith("{{"):
@@ -289,25 +226,26 @@ def _parse_tree(text: str) -> list:
                 block, current = stack.pop()
                 if block.tag == name[3:]:
                     break
-    if position < len(text):
-        current.append(text[position:])
+    current.append(text[position:])
     return root
 
 
-def _gap_limit(source: str) -> int:
+def _placeholder_name(source: str) -> str:
     match = _PLACEHOLDER_NAME.match(source)
-    name = match.group(1).lower() if match else ""
+    return match.group(1).lower() if match else ""
+
+
+def _gap_limit(name: str) -> int:
     if name.startswith("dc."):
         return UNKNOWN_DC_GAP
     return next((limit for pattern, limit in GAP_LIMITS if pattern.search(name)), DEFAULT_GAP)
 
 
 def _compile_placeholder(node: _Placeholder, dynamic: dict[str, list[str]], depth: int) -> tuple[list, str]:
-    match = _PLACEHOLDER_NAME.match(node.source)
-    name = match.group(1).lower() if match else ""
+    name = _placeholder_name(node.source)
     variants = dynamic.get(name) if name.startswith("dc.") and depth < MAX_DC_DEPTH else None
     if not variants:
-        return [_Gap(_gap_limit(node.source))], "".join(node.source.split())
+        return [_Gap(_gap_limit(name))], "".join(node.source.split())
     # A variant may be stored as HTML, which needs the same treatment as a rich text macro.
     compiled = [
         _compile_nodes(_parse_tree(html_to_text(v) if _HTML_TAG.search(v) else v), dynamic, depth + 1)
@@ -341,7 +279,7 @@ def _compile_nodes(nodes: list, dynamic: dict[str, list[str]], depth: int) -> tu
 
     parts: list = []
     display: list[str] = []
-    for i, piece in enumerate(_SLOT.split(normalize("".join(joined)))):
+    for i, piece in enumerate(_SLOT.split(_normalize("".join(joined)))):
         if i % 2 == 0:
             tokens = tuple(_TOKEN.findall(piece))
             if tokens:
@@ -356,18 +294,24 @@ def _compile_nodes(nodes: list, dynamic: dict[str, list[str]], depth: int) -> tu
     return parts, "".join(display)
 
 
+def _required_words(parts: list) -> int:
+    """How many fixed words must appear, whichever options are taken."""
+    total = 0
+    for part in parts:
+        if isinstance(part, _Literal):
+            total += sum(_is_word(t) for t in part.tokens)
+        elif isinstance(part, _Choice):
+            total += min(_required_words(option) for option in part.options)
+    return total
+
+
 @dataclass
 class Macro:
     core: list                 # parts from the first to the last that isn't a placeholder gap
     lead_words: int            # words the placeholders before the core can fill
     trail_words: int           # words the placeholders after the core can fill
     display_words: list[str]   # macro words with placeholders kept, for diffs
-    required_words: int
-
-    @property
-    def comparable(self) -> bool:
-        """False when nothing but placeholders is certain, so any comment could match."""
-        return self.required_words > 0
+    comparable: bool           # False when nothing but placeholders is certain, so any comment could match
 
 
 def compile_macro(text: str, dynamic: dict[str, list[str]] | None = None) -> Macro:
@@ -379,12 +323,8 @@ def compile_macro(text: str, dynamic: dict[str, list[str]] | None = None) -> Mac
         sum(part.max_words for part in parts[:first]),
         sum(part.max_words for part in parts[last:]),
         display.split(),
-        _required_words(parts),
+        _required_words(parts) > 0,
     )
-
-
-def is_placeholder(word: str) -> bool:
-    return "{{" in word or "{%" in word
 
 
 # ---- Comparing ---------------------------------------------------------------
@@ -392,7 +332,7 @@ def is_placeholder(word: str) -> bool:
 @dataclass
 class MacroResult:
     intact: bool
-    pct_edited: float  # 0 to 100, how much of the macro was edited, where 0 means intact
+    pct_of_macro: float  # 0 to 100, how much of the macro was edited, where 0 means intact
     diff: list[tuple[str, list[str]]] | None = None
 
 
@@ -400,6 +340,53 @@ class MacroResult:
 class Comparison:
     results: list[MacroResult]  # one per macro, in the order given
     added_text: bool            # words are left over that no macro accounts for
+
+
+def _outline(parts: list, available: set[str]) -> list:
+    """The macro as fixed words and gap sizes, taking the option closest to what was sent."""
+    outline: list = []
+    for part in parts:
+        if isinstance(part, _Literal):
+            outline.extend(t for t in part.tokens if _is_word(t))
+        elif isinstance(part, _Gap):
+            outline.append(part.max_words)
+        else:
+            options = [_outline(option, available) for option in part.options]
+            outline.extend(max(options, key=lambda o: (
+                sum(item in available for item in o if isinstance(item, str)),
+                -sum(isinstance(item, str) for item in o),
+            )))
+    return outline
+
+
+def _pct_of_macro(outline: list, sent_words: list[str]) -> tuple[float, list[tuple[int, int]]]:
+    """How much of a macro was edited, and which runs of sent words matched it (start, length).
+
+    A replaced stretch counts as its longer side. Words inserted where a
+    placeholder sits only count beyond what the placeholder can fill. Words
+    before the macro's first match or after its last are text added around it,
+    so they don't count.
+    """
+    words: list[str] = []
+    free: dict[int, int] = {}   # position in words -> how many words a gap there can fill
+    for item in outline:
+        if isinstance(item, str):
+            words.append(item)
+        else:
+            free[len(words)] = free.get(len(words), 0) + item
+    matcher = SequenceMatcher(None, words, sent_words, autojunk=False)
+    changed = 0
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        if i1 == 0 or i2 == len(words):
+            changed += i2 - i1
+        else:
+            allowed = sum(free.get(i, 0) for i in range(i1, i2 + 1))
+            changed += max(i2 - i1, j2 - j1 - allowed)
+    # An edited macro never reads 0%, even if only its punctuation changed.
+    pct = min(max(round(100 * changed / len(words), 1), 0.1), 100.0)
+    return pct, [(block.b, block.size) for block in matcher.get_matching_blocks() if block.size]
 
 
 def _candidates(macro: Macro, comment: _Comment) -> list[tuple[int, int]]:
@@ -430,9 +417,14 @@ def _place(candidates: list[list[tuple[int, int]]]) -> dict[int, tuple[int, int]
     """Give each macro its own range of the comment, with no word shared.
 
     Tries every arrangement. It keeps the most macros intact, then accounts for
-    the most text, so the result doesn't depend on the order macros were applied.
+    the most text, then takes the earliest text, so the result doesn't depend on
+    the order macros were applied. Only macros with identical text can still tie.
     """
     memo: dict[tuple[int, int], tuple[int, int, tuple]] = {}
+
+    def rank(option: tuple[int, int, tuple]) -> tuple:
+        placed, covered, spots = option
+        return placed, covered, tuple((-start, -end) for _, start, end in spots)
 
     def best(position: int, used: int) -> tuple[int, int, tuple]:
         key = (position, used)
@@ -445,7 +437,7 @@ def _place(candidates: list[list[tuple[int, int]]]) -> dict[int, tuple[int, int]
                     if start >= position:
                         placed, covered, rest = best(end, used | 1 << index)
                         option = (placed + 1, covered + end - start, ((index, start, end), *rest))
-                        if option[:2] > result[:2]:
+                        if rank(option) > rank(result):
                             result = option
             memo[key] = result
         return memo[key]
@@ -453,8 +445,23 @@ def _place(candidates: list[list[tuple[int, int]]]) -> dict[int, tuple[int, int]
     return {index: (start, end) for index, start, end in best(0, 0)[2]}
 
 
+def _word_diff(before: list[str], after: list[str]) -> list[tuple[str, list[str]]]:
+    """Word-level diff as a list of ("equal" | "delete" | "insert", words)."""
+    ops: list[tuple[str, list[str]]] = []
+    matcher = SequenceMatcher(None, before, after, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            ops.append(("equal", before[i1:i2]))
+            continue
+        if i2 > i1:
+            ops.append(("delete", before[i1:i2]))
+        if j2 > j1:
+            ops.append(("insert", after[j1:j2]))
+    return ops
+
+
 def compare(macros: list[Macro], sent: str) -> Comparison:
-    """Compare the sent text against every macro applied in the same update."""
+    """Compare the sent text against every comparable macro applied in the same update."""
     comment = _Comment(sent)
     placed = _place([_candidates(macro, comment) for macro in macros])
     claimed = [False] * len(comment.tokens)
@@ -476,26 +483,15 @@ def compare(macros: list[Macro], sent: str) -> Comparison:
     outlines = {index: _outline(macros[index].core, available) for index in edited}
     for index in sorted(edited, key=lambda i: -sum(isinstance(item, str) for item in outlines[i])):
         open_words = [i for i in range(len(claimed)) if comment.is_word[i] and not claimed[i]]
-        pct, matches = _pct_edited(outlines[index], [comment.tokens[i] for i in open_words])
+        pct, matches = _pct_of_macro(outlines[index], [comment.tokens[i] for i in open_words])
         for start, size in matches:
             for i in open_words[start:start + size]:
                 claimed[i] = True
-        results[index] = MacroResult(False, pct, word_diff(macros[index].display_words, remaining))
+        results[index] = MacroResult(False, pct, _word_diff(macros[index].display_words, remaining))
 
     added = any(comment.is_word[i] and not claimed[i] for i in range(len(claimed)))
     return Comparison(results, added)
 
 
-def word_diff(before: list[str], after: list[str]) -> list[tuple[str, list[str]]]:
-    """Word-level diff as a list of ("equal" | "delete" | "insert", words)."""
-    ops: list[tuple[str, list[str]]] = []
-    matcher = SequenceMatcher(None, before, after, autojunk=False)
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        if tag == "equal":
-            ops.append(("equal", before[i1:i2]))
-            continue
-        if i2 > i1:
-            ops.append(("delete", before[i1:i2]))
-        if j2 > j1:
-            ops.append(("insert", after[j1:j2]))
-    return ops
+def is_placeholder(word: str) -> bool:
+    return "{{" in word or "{%" in word

@@ -101,6 +101,98 @@ class FetchTests(unittest.TestCase):
         with self.assertRaises(zendesk.ZendeskError):
             self.run_fetch(base_pages(), {audits_path(3): 400})
 
+    def test_server_errors_on_the_macro_list_stop_the_run(self):
+        pages = base_pages()
+        errors = {audits_path(3): 404, MACRO_PATH + "&include=usage_30d": 500}
+        with self.assertRaises(zendesk.ZendeskError):
+            self.run_fetch(pages, errors)
+
+    def test_a_use_exactly_at_the_start_of_the_period_counts(self):
+        at_start = {"id": 1, "ticket_id": 1, "created_at": SINCE.isoformat(), "author_id": 7,
+                    "events": [{"type": "MacroReference", "macro_id": 55}]}
+        fake = FakeZendesk({audits_path(1): {"audits": [at_start], "meta": {"has_more": False}}})
+        self.assertEqual(len(zendesk.fetch_ticket_macro_audits(fake, 1, SINCE)), 1)
+
+    def test_hidden_ticket_is_skipped(self):
+        fake = FakeZendesk({}, {audits_path(1): 403})
+        self.assertEqual(zendesk.fetch_ticket_macro_audits(fake, 1, SINCE), [])
+
+    def test_progress_is_reported(self):
+        messages = []
+        fake = FakeZendesk(base_pages(), {audits_path(3): 404, "/api/v2/macros/56.json": 404})
+        zendesk.fetch_all(fake, SINCE, log=messages.append, workers=1)
+        self.assertIn("Finding tickets updated in this period...", messages)
+        self.assertIn("Reading the history of 3 tickets...", messages)
+        self.assertTrue(any(m.startswith("  3 of 3 tickets read. 3 macro uses so far.") for m in messages))
+
+
+class FetchMacrosTests(unittest.TestCase):
+    def test_macro_missing_from_the_list_is_fetched_directly(self):
+        fake = FakeZendesk({MACRO_PATH + "&include=usage_30d": {"macros": [], "meta": {}},
+                            "/api/v2/macros/7.json": {"macro": {"id": 7, "title": "Direct"}}})
+        self.assertEqual(zendesk.fetch_macros(fake, ["7"], print)["7"]["title"], "Direct")
+
+    def test_only_wanted_macros_are_kept(self):
+        fake = FakeZendesk({MACRO_PATH + "&include=usage_30d": {"macros": [{"id": 1}, {"id": 2}], "meta": {}}})
+        self.assertEqual(set(zendesk.fetch_macros(fake, ["1"], print)), {"1"})
+
+    def test_unexpected_error_on_a_single_macro_stops_the_run(self):
+        fake = FakeZendesk({MACRO_PATH + "&include=usage_30d": {"macros": [], "meta": {}}},
+                           {"/api/v2/macros/7.json": 400})
+        with self.assertRaises(zendesk.ZendeskError):
+            zendesk.fetch_macros(fake, ["7"], print)
+
+    def test_no_usage_counts_is_reported(self):
+        messages = []
+        fake = FakeZendesk({MACRO_PATH: {"macros": [], "meta": {}}}, {MACRO_PATH + "&include=usage_30d": 403})
+        zendesk.fetch_macros(fake, [], messages.append)
+        self.assertEqual(len(messages), 1)
+
+
+class DynamicContentTests(unittest.TestCase):
+    PATH = "/api/v2/dynamic_content/items.json"
+
+    def test_default_variant_comes_first(self):
+        item = {"placeholder": "{{dc.Bye}}", "variants": [{"content": "Salut"}, {"content": "Bye", "default": True},
+                                                          {"content": ""}]}
+        fake = FakeZendesk({self.PATH: {"items": [item]}})
+        self.assertEqual(zendesk.fetch_dynamic_content(fake, print), {"dc.bye": ["Bye", "Salut"]})
+
+    def test_item_with_nothing_usable_is_left_out(self):
+        fake = FakeZendesk({self.PATH: {"items": [{"placeholder": "{{dc.a}}", "variants": []},
+                                                  {"placeholder": "", "variants": [{"content": "x"}]}]}})
+        self.assertEqual(zendesk.fetch_dynamic_content(fake, print), {})
+
+    def test_error_is_reported_and_keeps_what_it_has(self):
+        messages = []
+        fake = FakeZendesk({}, {self.PATH: 403})
+        self.assertEqual(zendesk.fetch_dynamic_content(fake, messages.append), {})
+        self.assertIn("403", messages[0])
+
+    def test_only_fetched_when_a_macro_uses_it(self):
+        pages = base_pages()
+        errors = {audits_path(3): 404, "/api/v2/macros/56.json": 404}
+        fake = FakeZendesk(pages, errors)
+        self.assertEqual(zendesk.fetch_all(fake, SINCE, log=lambda _: None)["dynamic"], {})
+        self.assertNotIn(self.PATH, fake.calls)
+
+        macro = pages[MACRO_PATH + "&include=usage_30d"]["macros"][0]
+        macro["actions"][0]["value"] = "Hi {{ dc.bye }}"
+        pages[self.PATH] = {"items": [{"placeholder": "{{dc.bye}}", "variants": [{"content": "Bye"}]}]}
+        data = zendesk.fetch_all(FakeZendesk(pages, errors), SINCE, log=lambda _: None)
+        self.assertEqual(data["dynamic"], {"dc.bye": ["Bye"]})
+
+
+class FetchUsersTests(unittest.TestCase):
+    def test_asks_in_groups_of_100(self):
+        ids = [str(i) for i in range(1, 102)]
+        by_order = sorted(ids)
+        pages = {f"/api/v2/users/show_many.json?ids={','.join(by_order[:100])}": {"users": [{"id": 1}]},
+                 f"/api/v2/users/show_many.json?ids={by_order[100]}": {"users": [{"id": 2}]}}
+        fake = FakeZendesk(pages)
+        self.assertEqual(set(zendesk.fetch_users(fake, ids + ["1", None])), {"1", "2"})
+        self.assertEqual(len(fake.calls), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

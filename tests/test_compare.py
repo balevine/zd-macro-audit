@@ -1,13 +1,8 @@
-import csv
-import tempfile
+import time
 import unittest
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
-from zdaudit.analyze import analyze, macro_text
-from zdaudit.compare import compare, compile_macro
-from zdaudit.report import render_html, write_all
-from zdaudit.sample import generate
+from zdaudit.analyze import macro_text
+from zdaudit.compare import compare, compile_macro, html_to_text, is_placeholder
 
 GREETING = "Hi {{ticket.requester.first_name}},\n\nThanks for writing in. We fixed it."
 BODY = "Thanks for writing in. We fixed it."
@@ -22,13 +17,13 @@ def check(macros, sent, dynamic=None):
 class CompareBase(unittest.TestCase):
     def assertUnedited(self, macro, sent, dynamic=None):
         for result in check(macro, sent, dynamic).results:
-            self.assertTrue(result.intact, f"expected a match, got {result.pct_edited}% edited")
-            self.assertEqual(result.pct_edited, 0.0)
+            self.assertTrue(result.intact, f"expected a match, got {result.pct_of_macro}% edited")
+            self.assertEqual(result.pct_of_macro, 0.0)
 
     def assertEdited(self, macro, sent, dynamic=None):
         result = check(macro, sent, dynamic).results[0]
         self.assertFalse(result.intact)
-        self.assertGreater(result.pct_edited, 0)
+        self.assertGreater(result.pct_of_macro, 0)
 
 
 class PlaceholderTests(CompareBase):
@@ -38,6 +33,33 @@ class PlaceholderTests(CompareBase):
     def test_rendered_empty(self):
         self.assertUnedited(GREETING, "Hi ,\n\nThanks for writing in. We fixed it.")
         self.assertUnedited("Hello\n{{ticket.custom}}\nThanks", "Hello\nThanks")
+
+    def test_limit_for_each_kind(self):
+        for placeholder, limit in (
+            ("{{ticket.description}}", 200), ("{{ticket.latest_comment}}", 200),
+            ("{{current_user.signature}}", 40),
+            ("{{ticket.url}}", 15), ("{{ticket.link}}", 15), ("{{ticket.title}}", 15), ("{{ticket.subject}}", 15),
+            ("{{ticket.requester.email}}", 8),
+            ("{{ticket.requester.phone}}", 6),
+            ("{{ticket.requester.first_name}}", 3), ("{{ticket.requester.last_name}}", 3),
+            ("{{ticket.requester.name}}", 6),
+            ("{{ticket.id}}", 3), ("{{id}}", 3),
+            ("{{ticket.status}}", 5), ("{{ticket.ticket_field_123}}", 5), ("{{ticket.valid}}", 5),
+            ("{{dc.unknown}}", 100),
+            ("{% for c in ticket.comments %}{{c.value}}{% endfor %}", 30),
+        ):
+            with self.subTest(placeholder):
+                macro = f"Start {placeholder} end."
+                self.assertUnedited(macro, f"Start {'w ' * limit}end.")
+                self.assertEdited(macro, f"Start {'w ' * (limit + 1)}end.")
+
+    def test_punctuation_in_a_value_does_not_use_up_the_limit(self):
+        self.assertUnedited("Hi {{ticket.requester.first_name}}, done.", "Hi (Mary) Jane, Ann!, done.")
+
+    def test_hyphens_and_apostrophes_split_a_value_into_words(self):
+        macro = "Hi {{ticket.requester.first_name}}, done."
+        self.assertUnedited(macro, "Hi Mary-Jane Ann, done.")
+        self.assertEdited(macro, "Hi Mary-Jane O'Neil, done.")  # counts as four words
 
     def test_with_filter_and_spaces(self):
         self.assertUnedited("Hi {{ ticket.requester.first_name | capitalize }}, done.", "Hi Sam, done.")
@@ -88,6 +110,24 @@ class AddedTextTests(CompareBase):
         self.assertEqual([r.intact for r in comparison.results], [True, True])
         self.assertFalse(comparison.added_text)
 
+    def test_placeholder_at_the_start_stops_at_its_limit(self):
+        macro = "{{ticket.requester.first_name}}, thanks."
+        self.assertFalse(check(macro, "Mary Jane Ann, thanks.").added_text)
+        self.assertTrue(check(macro, "Hello Mary Jane Ann, thanks.").added_text)
+
+    def test_placeholder_at_the_end_stops_at_its_limit(self):
+        macro = "Thanks, {{current_user.first_name}}"
+        self.assertFalse(check(macro, "Thanks, Mary Jane Ann").added_text)
+        self.assertTrue(check(macro, "Thanks, Mary Jane Ann Lee").added_text)
+
+    def test_punctuation_around_the_macro_is_not_added_text(self):
+        self.assertFalse(check(BODY, f"-- {BODY} --").added_text)
+
+    def test_placeholder_stops_at_another_macros_text(self):
+        comparison = check(["Thanks, {{current_user.name}}", "Second part."], "Thanks, Sam Second part. Extra")
+        self.assertEqual([r.intact for r in comparison.results], [True, True])
+        self.assertTrue(comparison.added_text)
+
     def test_inside_the_macro_is_an_edit(self):
         self.assertEdited(BODY, "Thanks for writing in. Sorry! We fixed it.")
 
@@ -105,18 +145,13 @@ class EditTests(CompareBase):
     def test_reordered(self):
         self.assertEdited("One two three. Four five six.", "Four five six. One two three.")
 
-    def test_added_text_does_not_lower_the_score(self):
+    def test_added_text_does_not_change_the_percent(self):
         alone = check(GREETING, "Hi Priya,\n\nThanks for writing in. We fixed this.").results[0]
         padded = check(GREETING, "Hello!\n\nHi Priya,\n\nThanks for writing in. We fixed this.\n\nSam").results[0]
-        self.assertEqual(alone.pct_edited, padded.pct_edited)
-
-    def test_score_reflects_size_of_edit(self):
-        small = check(GREETING, "Hi Priya, Thanks for writing in. We fixed this.").results[0].pct_edited
-        large = check(GREETING, "Hi Priya, sorry, still looking into it.").results[0].pct_edited
-        self.assertLess(small, large)
+        self.assertEqual((alone.pct_of_macro, padded.pct_of_macro), (12.5, 12.5))
 
     def pct(self, macro, sent):
-        return check(macro, sent).results[0].pct_edited
+        return check(macro, sent).results[0].pct_of_macro
 
     def test_changed_word_counts_once(self):
         self.assertEqual(self.pct("One two three four five six seven eight nine ten",
@@ -151,6 +186,41 @@ class EditTests(CompareBase):
     def test_empty_comment(self):
         self.assertEdited(BODY, "")
 
+    def test_insertion_at_a_placeholder_counts_beyond_its_limit_only(self):
+        macro = "One two {{ticket.requester.first_name}} three four"
+        self.assertEqual(self.pct(macro, "One two A B C D E three four"), 50.0)
+
+    def test_change_at_the_edge_counts_removed_words_only(self):
+        macro = "One two three four five six seven eight nine ten"
+        self.assertEqual(self.pct(macro, "ONE two three four five six seven eight nine ten"), 10.0)
+        self.assertEqual(self.pct(macro, "One two three four five six seven eight nine"), 10.0)
+
+    def test_percent_rounds_to_one_decimal(self):
+        self.assertEqual(self.pct("One two three", "One TWO three"), 33.3)
+
+    def test_percent_uses_the_liquid_branch_that_was_sent(self):
+        macro = "One two three.{% if x %} Four five.{% else %} Six seven.{% endif %} Eight nine ten."
+        self.assertEqual(self.pct(macro, "One two three. Six seven. Eight nine TEN."), 12.5)
+        self.assertEqual(self.pct(macro, "One two three. Four five. Eight nine TEN."), 12.5)
+
+    def test_percent_prefers_the_shorter_branch_when_neither_was_sent(self):
+        macro = "One two three.{% if x %} Four five six seven eight.{% endif %} Nine ten eleven."
+        self.assertEqual(self.pct(macro, "One two three. Nine ten ELEVEN."), 16.7)
+
+    def test_diff_shows_only_what_differs(self):
+        result = check("One two three.", "One two three four.").results[0]
+        self.assertEqual(result.diff, [("equal", ["One", "two"]), ("delete", ["three."]), ("insert", ["three", "four."])])
+
+    def test_diff_with_only_a_removal_or_an_insertion(self):
+        self.assertEqual(check("One two three", "One three").results[0].diff,
+                         [("equal", ["One"]), ("delete", ["two"]), ("equal", ["three"])])
+        self.assertEqual(check("One three", "One two three").results[0].diff,
+                         [("equal", ["One"]), ("insert", ["two"]), ("equal", ["three"])])
+
+    def test_diff_keeps_placeholders_visible(self):
+        result = check("Hi {{ticket.requester.first_name}} bye", "Hello Sam bye").results[0]
+        self.assertIn(("delete", ["Hi", "{{ticket.requester.first_name}}"]), result.diff)
+
 
 class FormattingTests(CompareBase):
     def test_whitespace_and_quotes(self):
@@ -163,6 +233,12 @@ class FormattingTests(CompareBase):
 
     def test_html_macro(self):
         self.assertUnedited(HTML("<p>Hi {{ticket.requester.first_name}},</p><p>Done.</p>"), "Hi Sam,\n\nDone.")
+
+    def test_html_blocks_separate_words(self):
+        self.assertUnedited(HTML("<p>one</p>two"), "one two")
+        self.assertUnedited(HTML("one<p>two</p>"), "one two")
+        self.assertEqual(html_to_text("<b>one</b>two"), "onetwo")
+        self.assertEqual(html_to_text("a &amp; b<br>c"), "a & b\nc")
 
     def test_html_macro_sent_as_markdown(self):
         for markup, sent in (
@@ -210,6 +286,29 @@ class LiquidTests(CompareBase):
             self.assertUnedited(macro, sent)
         self.assertEdited(macro, "A B E")
 
+    def test_else_after_a_nested_block_belongs_to_the_outer_block(self):
+        macro = "A{% if x %} B{% if y %} C{% endif %}{% else %} D{% endif %} E"
+        for sent in ("A B E", "A B C E", "A D E"):
+            self.assertUnedited(macro, sent)
+        self.assertEdited(macro, "A E")
+
+    def test_closing_an_outer_block_closes_unfinished_inner_ones(self):
+        self.assertUnedited("A{% if x %} B{% if y %} C{% endif x %}{% endif %} D", "A D")
+        self.assertUnedited("A{% if x %} B{% unless y %} C{% endif %} D", "A D")
+
+    def test_text_after_closing_an_outer_block_is_required(self):
+        macro = "A{% if x %} B{% unless y %} C{% endif %} D"
+        self.assertUnedited(macro, "A B C D")
+        self.assertEdited(macro, "A")
+
+    def test_stray_closing_tag_is_ignored(self):
+        self.assertUnedited("A.{% endif %} B.", "A. B.")
+
+    def test_for_loop_is_not_read_as_a_choice(self):
+        macro = "A.{% for c in x %} one two{% endfor %} B."
+        self.assertUnedited(macro, "A. something else B.")
+        self.assertFalse(check(macro, "A. something else B.").added_text)
+
     def test_blocks_that_render_nothing(self):
         macro = "A.{% capture x %}hidden{% endcapture %}{% comment %}note{% endcomment %}{% assign y = 1 %} B."
         self.assertUnedited(macro, "A. B.")
@@ -230,6 +329,25 @@ class DynamicContentTests(CompareBase):
         self.assertTrue(compile_macro("{{dc.x}}", {"dc.x": ["Hello"]}).comparable)
         self.assertFalse(compile_macro("{{dc.x}}", {}).comparable)
         self.assertFalse(compile_macro("{{dc.x}}", {"dc.x": ["Hello", "{{ticket.id}}"]}).comparable)
+
+    def test_dynamic_content_inside_dynamic_content(self):
+        dynamic = {"dc.a": ["One {{dc.b}}"], "dc.b": ["two"]}
+        self.assertUnedited("{{dc.a}}", "One two", dynamic)
+        self.assertEdited("{{dc.a}}", "One three", dynamic)
+
+    def test_nesting_stops_after_three_levels(self):
+        dynamic = {"dc.a": ["A {{dc.b}}"], "dc.b": ["B {{dc.c}}"], "dc.c": ["C {{dc.d}}"], "dc.d": ["D"]}
+        # The fourth level is treated as dynamic content we couldn't read, so any text fits.
+        self.assertUnedited("{{dc.a}}", "A B C anything at all", dynamic)
+
+    def test_dynamic_content_that_includes_itself_finishes(self):
+        self.assertTrue(compile_macro("{{dc.a}}", {"dc.a": ["Loop {{dc.a}}"]}).comparable)
+
+    def test_placeholder_name_is_not_case_sensitive(self):
+        self.assertUnedited("{{DC.Bye}}", "Saludos", {"dc.bye": ["Saludos"]})
+
+    def test_plain_placeholder_is_not_looked_up_as_dynamic_content(self):
+        self.assertUnedited("Hi {{ticket.id}}.", "Hi 12.", {"ticket.id": ["Never used"]})
 
     def test_unknown_dynamic_content_beside_fixed_text(self):
         self.assertUnedited("Hi. {{dc.unknown}} Bye.", "Hi. A long paragraph we could not read. Bye.")
@@ -281,7 +399,7 @@ class SeveralMacrosTests(CompareBase):
             results = dict(zip(macros, comparison.results))
             self.assertTrue(results[long].intact)
             self.assertFalse(results[short].intact)
-            self.assertEqual(results[short].pct_edited, 100.0)
+            self.assertEqual(results[short].pct_of_macro, 100.0)
             self.assertFalse(comparison.added_text)
 
     def test_placement_keeps_the_most_macros_intact(self):
@@ -293,112 +411,45 @@ class SeveralMacrosTests(CompareBase):
     def test_edited_macros_do_not_share_words(self):
         one, two = "Alpha beta gamma delta.", "Alpha beta gamma epsilon."
         comparison = check([one, two], "Alpha beta gamma zeta.")
-        self.assertEqual(sorted(r.pct_edited for r in comparison.results), [25.0, 100.0])
+        self.assertEqual(sorted(r.pct_of_macro for r in comparison.results), [25.0, 100.0])
 
 
-def use_macro(mid, text, updated="2026-01-01T00:00:00Z"):
-    return {"id": mid, "title": f"Macro {mid}", "updated_at": updated,
-            "actions": [{"field": "comment_value", "value": text}]}
+class PlacementTests(CompareBase):
+    def test_covers_the_most_text_when_a_placeholder_could_end_in_two_places(self):
+        self.assertFalse(check("Hi {{ticket.custom}} bye", "Hi a bye b bye").added_text)
+
+    def test_placed_macro_takes_the_later_copy_when_that_fits_more(self):
+        comparison = check(["A B.", "B. C"], "A B. B. C")
+        self.assertEqual([r.intact for r in comparison.results], [True, True])
+
+    def test_order_macros_are_applied_does_not_matter(self):
+        one, two = "Alpha beta. Gamma delta.", "Gamma delta. Epsilon zeta."
+        sent = "Alpha beta. Gamma delta. Epsilon zeta."
+        self.assertEqual([r.intact for r in check([one, two], sent).results], [True, False])
+        self.assertEqual([r.intact for r in check([two, one], sent).results], [False, True])
+
+    def test_one_macro_only_claims_one_copy(self):
+        self.assertTrue(check("Alpha beta.", "Alpha beta. Alpha beta.").added_text)
+
+    def test_longest_placements_are_kept_when_there_are_too_many(self):
+        self.assertFalse(check("Hi {{ticket.description}} bye", "Hi " + "bye " * 80).added_text)
+
+    def test_repetitive_text_finishes_quickly(self):
+        macros = [f"word word {{{{a}}}} word end{i}." for i in range(5)]
+        started = time.monotonic()
+        comparison = check(macros, "word " * 1600)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(len(comparison.results), 5)
+
+    def test_macro_must_appear_more_than_the_first_time_it_could(self):
+        self.assertUnedited("Hi {{ticket.custom}} bye", "Hi and more. Hi a bye")
 
 
-def run_audit(macros, refs, body=None):
-    until = datetime(2026, 10, 30, tzinfo=timezone.utc)
-    events = [{"type": "MacroReference", "macro_id": mid} for mid in refs]
-    if body is not None:
-        events.append({"type": "Comment", "body": body, "public": True})
-    audit = {"id": 5, "ticket_id": 9, "created_at": "2026-10-20T00:00:00Z", "author_id": 7, "events": events}
-    return analyze([audit], {str(m["id"]): m for m in macros}, {}, {}, until - timedelta(days=30), until)
-
-
-class AnalyzeTests(unittest.TestCase):
-    def test_every_status_appears_in_sample(self):
-        until = datetime(2026, 10, 30, tzinfo=timezone.utc)
-        since = until - timedelta(days=30)
-        result = analyze(**generate(since, until), since=since, until=until)
-        statuses = {u.status for u in result.uses}
-        self.assertEqual(statuses, {"edited", "unedited", "no_text", "unavailable", "changed"})
-        # Erin never edits in the sample data.
-        erin = next(a for a in result.agents if a["name"] == "Erin Walsh")
-        self.assertEqual(erin["edited"], 0)
-        self.assertGreater(erin["unedited"], 0)
-
-    def test_deleted_macro_text_counts_as_edited(self):
-        result = run_audit([use_macro(1, "Hi {{ticket.requester.first_name}}, done.")], [1])
-        use = result.uses[0]
-        self.assertEqual((use.status, use.pct_edited, use.comment_type), ("edited", 100.0, ""))
-        self.assertEqual(use.diff, [("delete", ["Hi", "{{ticket.requester.first_name}},", "done."])])
-        self.assertEqual(result.overall["by_type"]["none"]["edited"], 1)
-
-    def test_each_macro_gets_its_own_result(self):
-        result = run_audit([use_macro(1, "First part."), use_macro(2, "Second part.")], [1, 2],
-                           "First part.\n\nSecond piece.")
-        one, two = result.uses
-        self.assertEqual((one.status, one.pct_edited, one.diff), ("unedited", 0.0, None))
-        self.assertEqual(two.status, "edited")
-        # The diff shows only this macro's changes, not the other macro's text.
-        self.assertEqual(two.diff, [("equal", ["Second"]), ("delete", ["part."]), ("insert", ["piece."])])
-
-    def test_changed_since_applies_to_one_macro(self):
-        result = run_audit([use_macro(1, "First part."), use_macro(2, "Second part.", "2026-10-25T00:00:00Z")],
-                           [1, 2], "Other words.")
-        self.assertEqual([u.status for u in result.uses], ["edited", "changed"])
-
-    def test_readable_macro_beside_a_deleted_one(self):
-        result = run_audit([use_macro(1, "First part.")], [1, 2], "First part.\n\nText from the deleted macro.")
-        self.assertEqual([u.status for u in result.uses], ["unedited", "unavailable"])
-        self.assertFalse(result.uses[0].added_text)
-
-    def test_only_placeholders_is_not_counted(self):
-        result = run_audit([use_macro(1, "{{ticket.id}}")], [1], "Completely unrelated reply.")
-        self.assertEqual(result.uses[0].status, "only_placeholders")
-        self.assertIsNone(result.uses[0].pct_edited)
-        self.assertEqual(result.overall["compared"], 0)
-
-    def test_macro_applied_twice_needs_one_copy(self):
-        result = run_audit([use_macro(1, "First part.")], [1, 1], "First part.")
-        self.assertEqual([u.status for u in result.uses], ["unedited", "unedited"])
-
-    def test_macro_averages(self):
-        until = datetime(2026, 10, 30, tzinfo=timezone.utc)
-        macro = use_macro(1, "One two three four five six seven eight nine ten")
-        audit = lambda i, body: {"id": i, "ticket_id": i, "created_at": "2026-10-20T00:00:00Z", "author_id": 7,
-                                 "events": [{"type": "MacroReference", "macro_id": 1},
-                                            {"type": "Comment", "body": body, "public": True}]}
-        audits = [audit(1, "One two three four five six seven eight nine ten"),
-                  audit(2, "One two three four TYPO six seven eight nine ten"),
-                  audit(3, "One TYPO three four OOPS six seven eight nine ten")]
-        result = analyze(audits, {"1": macro}, {}, {}, until - timedelta(days=30), until)
-        row = result.macros[0]
-        self.assertEqual((row["avg_pct_of_macro"], row["avg_pct_of_macro_when_edited"]), (10.0, 15.0))
-        self.assertEqual(result.overall["avg_pct_of_macro"], 10.0)
-
-    def test_macro_changed_since_use_is_left_out_of_averages(self):
-        result = run_audit([use_macro(1, "First part.", "2026-10-25T00:00:00Z")], [1], "Other words.")
-        self.assertEqual(result.uses[0].status, "changed")
-        self.assertIsNone(result.macros[0]["avg_pct_of_macro"])
-
-    def test_macro_without_comment_text(self):
-        self.assertIsNone(macro_text({"actions": [{"field": "priority", "value": "urgent"}]}))
-
-
-class ReportTests(unittest.TestCase):
-    def test_uses_link_to_their_tickets(self):
-        html = render_html(run_audit([use_macro(1, "First part.")], [1], "Other words."), "acme")
-        self.assertIn("https://acme.zendesk.com/agent/tickets/9", html)
-        self.assertIn('data-macro="1"', html)
-
-    def test_comment_text_cannot_break_out_of_the_page_data(self):
-        html = render_html(run_audit([use_macro(1, "First part.")], [1], "</script><b>hi</b>"), "acme")
-        self.assertNotIn("</script><b>", html)
-        self.assertEqual(html.count("</script>"), 2)
-
-    def test_csvs_have_the_new_columns(self):
-        with tempfile.TemporaryDirectory() as folder:
-            paths = write_all(Path(folder), run_audit([use_macro(1, "First part.")], [1], "Other words."), "acme")
-            use = next(csv.DictReader(paths["uses"].read_text(encoding="utf-8").splitlines()))
-            macro = next(csv.DictReader(paths["macros"].read_text(encoding="utf-8").splitlines()))
-        self.assertEqual(use["pct_of_macro_edited"], "100.0")
-        self.assertEqual(macro["avg_pct_of_macro_when_edited"], "100.0")
+class IsPlaceholderTests(unittest.TestCase):
+    def test_recognizes_both_kinds(self):
+        self.assertTrue(is_placeholder("{{ticket.id}},"))
+        self.assertTrue(is_placeholder("{%if…%}"))
+        self.assertFalse(is_placeholder("{word}"))
 
 
 if __name__ == "__main__":

@@ -36,6 +36,7 @@ DYNAMIC = {
 SHIPPING_OLD = ("Hi {{ticket.requester.first_name}},\n\nSorry your order is running late. "
                 "Our carrier is behind this week, and we expect it to ship within 5 business days.")
 
+# Some of these only add text around the macro, which counts as kept intact.
 EDITS = [
     lambda t: t + " Let me know if you have any other questions!",
     lambda t: t.replace(" the ", " our ", 1),
@@ -52,7 +53,7 @@ USAGE = {2001: (30, 0.6), 2002: (18, 1.0), 2003: (12, 0.3), 2004: (10, 0), 2005:
 
 def _macros(old: str, changed: str) -> dict[str, dict]:
     def macro(mid, title, actions, updated=old):
-        return {"id": mid, "title": title, "actions": actions, "updated_at": updated, "active": True}
+        return {"id": mid, "title": title, "actions": actions, "updated_at": updated}
 
     items = [
         macro(2001, "Password reset steps", [{"field": "comment_value_html", "value":

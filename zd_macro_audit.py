@@ -87,16 +87,16 @@ def load_config(path: Path, auth: str | None = None) -> dict:
 
 def print_summary(result: analyze.Result, paths: dict[str, Path]) -> None:
     o = result.overall
-    fmt = lambda v: "n/a" if v is None else f"{v:.0f}%"
+    fmt = report.fmt_pct
     print(f"\nMacro uses found:     {o['uses']:,} ({o['macros_used']:,} macros)")
     print(f"Compared:             {o['compared']:,}")
-    print(f"Sent edited:          {o['edited']:,} ({fmt(o['pct_edited'])})")
-    print(f"Kept intact:          {o['unedited']:,} ({fmt(o['pct_unedited'])}), {o['added_text']:,} with text added around it")
+    print(f"Sent edited:          {o['edited']:,} ({fmt(o['pct_uses_edited'])})")
+    print(f"Kept intact:          {o['unedited']:,} ({fmt(o['pct_uses_intact'])}), {o['added_text']:,} with text added around it")
     print(f"Agents who edit:      {o['agents_editing']:,} of {o['agents_using']:,} ({fmt(o['pct_agents_editing'])})")
     for kind, label in (("public", "Public"), ("internal", "Internal"), ("none", "No comment")):
         t = o["by_type"][kind]
         if t["compared"] or kind != "none":
-            print(f"  {label + ':':<19} {t['edited']:,} of {t['compared']:,} edited ({fmt(t['pct_edited'])})")
+            print(f"  {label + ':':<19} {t['edited']:,} of {t['compared']:,} edited ({fmt(t['pct_uses_edited'])})")
     skipped = sum(o["excluded"].values())
     if skipped:
         print(f"Not compared:         {skipped:,} (see the report for why)")

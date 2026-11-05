@@ -208,6 +208,7 @@ Some uses can't be judged, so they're left out of the percentages and listed sep
 | `zdaudit/compare.py` | Works out which words of a comment came from which macro, and measures how much of it was edited. |
 | `zdaudit/analyze.py` | Turns raw data into per-use results and totals. |
 | `zdaudit/report.py` | Writes the HTML report and CSV files. |
+| `zdaudit/assets/` | The report's styles and script, which are copied into each report. |
 | `zdaudit/sample.py` | The made-up data behind `--sample`. |
 | `tests/` | Tests. Run them with `python3 -m unittest`. |
 
