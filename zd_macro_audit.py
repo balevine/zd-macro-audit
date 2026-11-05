@@ -18,10 +18,12 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from zdaudit import analyze, report, sample, zendesk
+from zdaudit import analyze, keychain, report, sample, zendesk
 
 HERE = Path(__file__).resolve().parent
 MAX_IDS_SHOWN = 20  # ticket IDs listed in the terminal summary
+NOT_AVAILABLE = ("This tool only signs in to Zendesk on macOS for now, because it keeps sign-in details in the "
+                 "macOS keychain. Windows and Linux aren't available yet. --sample still works here.")
 
 
 def clean_subdomain(value: str) -> str:
@@ -41,28 +43,42 @@ def clean_subdomain(value: str) -> str:
 ENV_VARS = {"subdomain": "ZENDESK_SUBDOMAIN", "client_id": "ZENDESK_CLIENT_ID",
             "client_secret": "ZENDESK_CLIENT_SECRET", "email": "ZENDESK_EMAIL",
             "api_token": "ZENDESK_API_TOKEN"}
+SECRETS = ("client_secret", "api_token")
 
 
 def load_config(path: Path, auth: str | None = None) -> dict:
-    """Settings from config.json and the environment, asking for anything missing.
+    """Settings from config.json, the keychain and the environment, asking for anything missing.
 
     `auth` is "token" or "oauth" when chosen on the command line. Otherwise a
     saved API token wins, then a saved OAuth client, and a first run asks.
+    Secrets only ever go in the keychain. Any still in config.json move there.
     """
     saved = json.loads(path.read_text()) if path.exists() else {}
-    config = {key: os.environ.get(env) or saved.get(key, "") for key, env in ENV_VARS.items()}
+    config = {key: os.environ.get(env) or saved.get(key, "") for key, env in ENV_VARS.items() if key not in SECRETS}
     config["subdomain"] = clean_subdomain(config["subdomain"])
+    for_keychain = {}
     asked = False
 
     def ask(key: str, prompt: str, hidden: bool = False) -> None:
         nonlocal asked
         value = (getpass.getpass if hidden else input)(prompt).strip()
-        config[key] = saved[key] = clean_subdomain(value) if key == "subdomain" else value
+        config[key] = clean_subdomain(value) if key == "subdomain" else value
+        (for_keychain if key in SECRETS else saved)[key] = config[key]
         asked = True
 
     if not config["subdomain"]:
         print("First-time setup. README.md explains where to find each of these.\n")
         ask("subdomain", "Zendesk subdomain (the 'acme' in acme.zendesk.com): ")
+    if not config["subdomain"]:
+        sys.exit("Missing settings: subdomain")
+
+    in_file = [key for key in SECRETS if key in saved]
+    for key in SECRETS:
+        old = saved.pop(key, "")
+        if old:
+            for_keychain[key] = old
+        config[key] = os.environ.get(ENV_VARS[key]) or old or keychain.load(config["subdomain"], key)
+
     if not auth:
         if config["api_token"]:
             auth = "token"
@@ -77,20 +93,41 @@ def load_config(path: Path, auth: str | None = None) -> dict:
             ask("email", "Email of the admin who owns the API token: ")
         if not config["api_token"]:
             ask("api_token", "Zendesk API token (hidden): ", hidden=True)
-        required = ("subdomain", "email", "api_token")
+        required = ("email", "api_token")
     else:
         config["api_token"] = ""
         if not config["client_id"]:
             ask("client_id", "OAuth client unique identifier: ")
             ask("client_secret", "OAuth client secret (hidden, leave blank for a public client): ", hidden=True)
-        required = ("subdomain", "client_id")
+        required = ("client_id",)
 
     if not all(config[key] for key in required):
         sys.exit("Missing settings: " + ", ".join(k for k in required if not config[k]))
-    if asked:
+    for key, value in for_keychain.items():
+        keychain.save(config["subdomain"], key, value)
+    if asked or in_file:
         zendesk.write_private(path, json.dumps(saved, indent=2) + "\n")
-        print(f"Saved to {path.name}. Delete that file to start over.\n")
+        print(f"Saved secrets in the macOS keychain and other settings in {path.name}. "
+              "Use --sign-out and delete that file to start over.\n")
     return config
+
+
+def sign_out(path: Path) -> None:
+    """Remove this Zendesk account's secrets from the keychain."""
+    saved = json.loads(path.read_text()) if path.exists() else {}
+    subdomain = os.environ.get(ENV_VARS["subdomain"]) or saved.get("subdomain", "")
+    if not subdomain:
+        sys.exit(f"Nothing to sign out of, because {path.name} doesn't name a Zendesk subdomain.")
+    subdomain = clean_subdomain(subdomain)
+    for name in (keychain.OAUTH_TOKEN, *SECRETS):
+        keychain.delete(subdomain, name)
+    print(f"Removed the saved sign-in for {subdomain}.zendesk.com from the macOS keychain.")
+
+
+def warn_about_old_sign_in() -> None:
+    if (HERE / ".tokens").exists():
+        print(f"Warning: {HERE / '.tokens'} holds an old sign-in in plain text. "
+              "The tool no longer uses it, so please delete that folder.\n")
 
 
 def print_summary(result: analyze.Result, paths: dict[str, Path]) -> None:
@@ -147,6 +184,7 @@ def main(argv: list[str] | None = None) -> int:
     sign_in.add_argument("--oauth", dest="auth", action="store_const", const="oauth",
                          help="sign in with OAuth even if an API token is saved")
     parser.add_argument("--login", action="store_true", help="OAuth only. Sign in again even if a saved sign-in exists")
+    parser.add_argument("--sign-out", action="store_true", help="remove the saved secrets from the macOS keychain")
     parser.add_argument("--sample", action="store_true", help="use made-up data instead of Zendesk")
     parser.add_argument("--workers", type=int, default=4,
                         help="tickets to read at once (default 4). Lower it if other tools share your API limit")
@@ -155,18 +193,26 @@ def main(argv: list[str] | None = None) -> int:
     until = datetime.now(timezone.utc)
     since = until - timedelta(days=args.days)
 
+    if not args.sample and not keychain.supported():
+        print(NOT_AVAILABLE, file=sys.stderr)
+        return 1
+
     try:
+        if args.sign_out:
+            sign_out(Path(args.config))
+            return 0
         if args.sample:
             print("Using made-up sample data.")
             data, subdomain = sample.generate(since, until), None
         else:
+            warn_about_old_sign_in()
             config = load_config(Path(args.config), args.auth)
             subdomain = config["subdomain"]
-            zd = zendesk.Zendesk(subdomain, config["client_id"], config["client_secret"], HERE / ".tokens",
+            zd = zendesk.Zendesk(subdomain, config["client_id"], config["client_secret"],
                                  email=config["email"], api_token=config["api_token"])
             zd.authenticate(force=args.login)
             data = zendesk.fetch_all(zd, since, workers=max(1, args.workers))
-    except (zendesk.AuthError, zendesk.ZendeskError) as exc:
+    except (zendesk.AuthError, zendesk.ZendeskError, keychain.KeychainError) as exc:
         print(f"\nError: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:

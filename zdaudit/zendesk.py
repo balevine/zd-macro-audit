@@ -2,8 +2,8 @@
 
 Uses only the Python standard library. Sign-in uses the OAuth authorization
 code flow with PKCE. The browser sends Zendesk's reply to a small server on
-http://localhost:8765/callback, and the token is saved under .tokens/ so later
-runs skip the browser step.
+http://localhost:8765/callback, and the token is saved in the macOS keychain so
+later runs skip the browser step.
 
 An admin who already has a Zendesk API token can use it instead of OAuth.
 Requests then use basic auth with "{email}/token:{api_token}".
@@ -32,6 +32,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Iterator
+
+from . import keychain
 
 REDIRECT_PORT = 8765
 REDIRECT_URI = f"http://localhost:{REDIRECT_PORT}/callback"
@@ -180,13 +182,13 @@ def _wait_for_redirect(expected_state: str, timeout: int = 300) -> dict[str, str
 
 class Zendesk:
     def __init__(self, subdomain: str, client_id: str = "", client_secret: str = "",
-                 token_dir: Path = Path(".tokens"), email: str = "", api_token: str = ""):
+                 email: str = "", api_token: str = ""):
+        self.subdomain = subdomain
         self.client_id = client_id
         self.client_secret = client_secret
         self.email = email
         self.api_token = api_token
         self.base = f"https://{subdomain}.zendesk.com"
-        self.token_path = token_dir / f"{subdomain}.json"
         self.token: dict = {}
         self._refresh_lock = threading.Lock()
         self._connected = False  # whether Zendesk has answered yet
@@ -197,10 +199,10 @@ class Zendesk:
         if self.api_token:
             self._token_login()
             return
-        if not force and self.token_path.exists():
+        if not force:
             try:
-                self.token = json.loads(self.token_path.read_text())
-            except (OSError, json.JSONDecodeError):
+                self.token = json.loads(keychain.load(self.subdomain, keychain.OAUTH_TOKEN) or "{}")
+            except json.JSONDecodeError:
                 self.token = {}
         if not self.token.get("access_token"):
             self.login()
@@ -318,8 +320,7 @@ class Zendesk:
         if not token.get("refresh_token") and self.token.get("refresh_token"):
             token["refresh_token"] = self.token["refresh_token"]
         self.token = token
-        self.token_path.parent.mkdir(parents=True, exist_ok=True)
-        write_private(self.token_path, json.dumps(token))
+        keychain.save(self.subdomain, keychain.OAUTH_TOKEN, json.dumps(token))
 
     # ---- Requests ----------------------------------------------------------
 

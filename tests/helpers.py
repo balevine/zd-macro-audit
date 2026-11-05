@@ -1,10 +1,31 @@
 from datetime import datetime, timedelta, timezone
+from unittest import mock
 
+from zdaudit import keychain
 from zdaudit.analyze import analyze
 
 UNTIL = datetime(2026, 10, 30, tzinfo=timezone.utc)
 SINCE = UNTIL - timedelta(days=30)
 USED_AT = "2026-10-20T00:00:00Z"
+
+
+def fake_keychain(test):
+    """Replace the keychain with a dict of {(subdomain, name): secret} for this test."""
+    store = {}
+
+    def save(subdomain, name, secret):
+        if secret:
+            store[subdomain, name] = secret
+        else:
+            store.pop((subdomain, name), None)
+
+    for name, fake in (("save", save), ("load", lambda subdomain, name: store.get((subdomain, name), "")),
+                       ("delete", lambda subdomain, name: store.pop((subdomain, name), None)),
+                       ("supported", lambda: True)):
+        patcher = mock.patch.object(keychain, name, fake)
+        patcher.start()
+        test.addCleanup(patcher.stop)
+    return store
 
 
 def use_macro(mid, text, updated="2026-01-01T00:00:00Z", title=None, **extra):

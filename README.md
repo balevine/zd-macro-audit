@@ -22,7 +22,9 @@ Here's the top of a report made from the tool's sample data. Below this part, th
 
 ![The top of a macro edit report. It shows 447 macro uses, 12% sent edited, 88% kept intact, and 83% of agents editing, then lists which macros are edited most often and kept intact most often, a breakdown by public reply and internal note, and a table of every macro.](docs/report.png)
 
-It needs Python 3.9 or newer and nothing else. There's nothing to install.
+It runs on macOS with Python 3.9 or newer. There's nothing to install.
+
+**Windows and Linux aren't available at the moment.** The tool keeps sign-in details in the macOS keychain, and it won't sign in to Zendesk on a system where it would have to store them in plain text. On those systems, only `--sample` works.
 
 ## Try it without Zendesk
 
@@ -57,7 +59,7 @@ For the OAuth setup, your Zendesk account needs an "OAuth client", which is a sm
 6. Click **Save**.
 7. Zendesk now shows a **Secret**. Copy it right away, because Zendesk only shows it once. If you lose it, click **Regenerate** on the same page to get a new one.
 
-You'll paste the unique identifier and the secret into the tool the first time you run it. See [Run it](#run-it). The tool saves them in `config.json`, so you only do this once. Keep the secret private, like a password.
+You'll paste the unique identifier and the secret into the tool the first time you run it. See [Run it](#run-it). The tool saves the unique identifier in `config.json` and the secret in the macOS keychain, so you only do this once. Keep the secret private, like a password.
 
 ## Run it
 
@@ -70,9 +72,11 @@ The first time, it asks for your Zendesk subdomain. For `acme.zendesk.com`, that
 1. The unique identifier from step 5.
 2. The secret from step 7. Nothing shows on screen while you paste or type it, so it stays private. Paste it and press Enter.
 
-It saves these in `config.json` in this folder. Then it opens your browser so you can sign in to Zendesk and click **Allow**. Sign in as an admin, because only admins can read every ticket's history. After that, the browser tab says you can close it, and the tool carries on in the terminal.
+It saves the unique identifier in `config.json` in this folder and the secret in the macOS keychain. Then it opens your browser so you can sign in to Zendesk and click **Allow**. Sign in as an admin, because only admins can read every ticket's history. After that, the browser tab says you can close it, and the tool carries on in the terminal.
 
-Later runs reuse the saved sign-in and go straight to work.
+Later runs reuse the saved sign-in and go straight to work. macOS may ask you to allow access to the keychain, or to unlock it.
+
+If you ran an earlier version, the tool moves any secrets it finds in `config.json` to the keychain. It doesn't use `.tokens/` any more, so it warns you until you delete that folder. You'll sign in through the browser once more.
 
 ### Sign in with an API token
 
@@ -82,11 +86,11 @@ If the admin already has a Zendesk API token, the tool can use it instead of OAu
 python3 zd_macro_audit.py --api-token
 ```
 
-It asks for the admin's email and the token, and saves both in `config.json`. Like the OAuth secret, the token doesn't show on screen as you paste it. Later runs use the saved token without the flag. The token must belong to an admin, because only admins can read every ticket's history.
+It asks for the admin's email and the token. It saves the email in `config.json` and the token in the macOS keychain. Like the OAuth secret, the token doesn't show on screen as you paste it. Later runs use the saved token without the flag. The token must belong to an admin, because only admins can read every ticket's history.
 
 To find or make a token, go to **Admin Center > Apps and integrations > APIs > API tokens**. Zendesk only shows a new token once, so copy it right away. If that page says token access is off, turn it on there.
 
-In `config.json` the token is saved as `email` and `api_token`. Leave `api_token` empty to use OAuth. If the file holds both an API token and an OAuth client, the token wins. Run with `--oauth` to use OAuth instead.
+If both an API token and an OAuth client are saved, the token wins. Run with `--oauth` to use OAuth instead.
 
 ### Options
 
@@ -97,11 +101,12 @@ In `config.json` the token is saved as `email` and `api_token`. Leave `api_token
 | `--api-token` | Sign in with an admin's existing API token instead of OAuth. |
 | `--oauth` | Sign in with OAuth even if an API token is saved. |
 | `--login` | Sign in to OAuth again, for example as a different admin. |
+| `--sign-out` | Remove this Zendesk account's saved sign-in, OAuth secret and API token from the keychain. |
 | `--sample` | Use made-up data instead of Zendesk. |
 | `--config other.json` | Use a different settings file, for example one per Zendesk account. |
 | `--workers 2` | Read 2 tickets at a time instead of 4. Lower this if other tools share your Zendesk API limit. |
 
-You can also pass settings through environment variables instead of `config.json`. Use `ZENDESK_SUBDOMAIN` with either `ZENDESK_CLIENT_ID` and `ZENDESK_CLIENT_SECRET` for OAuth, or `ZENDESK_EMAIL` and `ZENDESK_API_TOKEN` for an API token. Settings from the environment are never written to `config.json`.
+You can also pass settings through environment variables instead of `config.json`. Use `ZENDESK_SUBDOMAIN` with either `ZENDESK_CLIENT_ID` and `ZENDESK_CLIENT_SECRET` for OAuth, or `ZENDESK_EMAIL` and `ZENDESK_API_TOKEN` for an API token. Settings from the environment are never saved.
 
 ### How long it takes
 
@@ -208,10 +213,10 @@ Some uses can't be judged, so they're left out of the percentages and listed sep
 ## Privacy and access
 
 - The tool only reads from Zendesk. It never changes anything in your account.
-- With OAuth, the tool asks Zendesk for **read** access only. Your sign-in is saved in `.tokens/` in this folder, readable only by your user account. Delete that folder to sign out. To cut off access completely, delete the OAuth client in Admin Center.
-- An API token can't be limited to reading. It has the full rights of the admin who owns it, so anyone holding it can read and change everything that admin can. The tool itself only reads. Where you can, use OAuth instead, since it only gets read access. Treat `config.json` like a password. The file is readable only by your user account. To cut off access, delete the token in Admin Center.
+- With OAuth, the tool asks Zendesk for **read** access only. Your sign-in and the OAuth secret are saved in the macOS keychain, under `zd-macro-audit`, and never in this folder. Run with `--sign-out` to remove them. To cut off access completely, delete the OAuth client in Admin Center.
+- An API token can't be limited to reading. It has the full rights of the admin who owns it, so anyone holding it can read and change everything that admin can. The tool itself only reads. Where you can, use OAuth instead, since it only gets read access. The tool saves the token in the macOS keychain, and `--sign-out` removes it. To cut off access, delete the token in Admin Center.
+- The keychain keeps secrets encrypted and out of this folder, so they don't travel with a zip, a backup or a shared folder. It doesn't protect against other programs running under your account, which can ask the `security` command for them.
 - The report contains text from ticket comments, both public replies to customers and internal notes, which can include customer details. The report and CSVs contain agent names and emails. Treat them as sensitive, and check before you forward them or upload them anywhere.
-- Don't share, copy or upload `config.json` or `.tokens/`. They hold your secret, token and sign-in.
 
 ## Files
 
@@ -219,6 +224,7 @@ Some uses can't be judged, so they're left out of the percentages and listed sep
 | --- | --- |
 | `zd_macro_audit.py` | The command you run. |
 | `zdaudit/zendesk.py` | OAuth and API token sign-in, and the Zendesk API calls. |
+| `zdaudit/keychain.py` | Saves and reads secrets in the macOS keychain. |
 | `zdaudit/compare.py` | Works out which words of a comment came from which macro, and measures how much of it was edited. |
 | `zdaudit/analyze.py` | Turns raw data into per-use results and totals. |
 | `zdaudit/report.py` | Writes the HTML report and CSV files. |

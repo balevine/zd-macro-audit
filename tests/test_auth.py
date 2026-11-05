@@ -19,7 +19,8 @@ from email.message import Message
 from pathlib import Path
 from unittest import mock
 
-from zdaudit import zendesk
+from tests.helpers import fake_keychain
+from zdaudit import keychain, zendesk
 from zdaudit.zendesk import AuthError, Zendesk, ZendeskError
 
 ME = {"user": {"id": 1, "name": "Admin", "email": "admin@acme.com", "role": "admin"}}
@@ -162,23 +163,20 @@ class TokenSignInTests(unittest.TestCase):
 
 class OAuthTestCase(unittest.TestCase):
     def setUp(self):
-        folder = tempfile.TemporaryDirectory()
-        self.addCleanup(folder.cleanup)
-        self.tokens = Path(folder.name) / "tokens"
-        self.zd = Zendesk("acme", "client", "shh", self.tokens)
+        self.keychain = fake_keychain(self)
+        self.zd = Zendesk("acme", "client", "shh")
         for target in ("builtins.print", "time.sleep", "webbrowser.open"):
             patcher = mock.patch(target)
             setattr(self, target.split(".")[1], patcher.start())
             self.addCleanup(patcher.stop)
 
     def saved(self):
-        return json.loads(self.zd.token_path.read_text())
+        return json.loads(self.keychain["acme", keychain.OAUTH_TOKEN])
 
 
 class SavedSignInTests(OAuthTestCase):
     def save(self, token):
-        self.tokens.mkdir()
-        self.zd.token_path.write_text(token)
+        self.keychain["acme", keychain.OAUTH_TOKEN] = token
 
     def test_saved_sign_in_skips_the_browser(self):
         self.save(json.dumps({"access_token": "saved"}))
@@ -200,7 +198,13 @@ class SavedSignInTests(OAuthTestCase):
         login.assert_called_once()
         self.assertEqual(self.zd.token, {})
 
-    def test_damaged_file_opens_the_browser(self):
+    def test_another_accounts_sign_in_is_not_used(self):
+        self.keychain["other", keychain.OAUTH_TOKEN] = json.dumps({"access_token": "other"})
+        with mock.patch.object(self.zd, "login") as login:
+            self.zd.authenticate()
+        login.assert_called_once()
+
+    def test_damaged_entry_opens_the_browser(self):
         self.save("{not json")
         with mock.patch.object(self.zd, "login") as login:
             self.zd.authenticate()
@@ -252,18 +256,7 @@ class LoginTests(OAuthTestCase):
         challenge = hashlib.sha256(payload["code_verifier"].encode()).digest()
         self.assertIn(base64.urlsafe_b64encode(challenge).rstrip(b"=").decode(), url)
         self.assertEqual(self.saved()["access_token"], "new")
-        self.assertEqual(self.zd.token_path.stat().st_mode & 0o777, 0o600)
         self.assertEqual(sent_header(self.requests[1]), "Bearer new")
-
-    def test_token_file_is_never_readable_by_others(self):
-        self.tokens.mkdir()
-        self.zd.token_path.write_text("an older, longer saved token")
-        os.chmod(self.zd.token_path, 0o644)
-        with modes_while_writing() as seen:
-            self.login(lambda state: {"code": "abc", "state": state}, {"access_token": "new", "refresh_token": "r"})
-        self.assertEqual(seen, [0o600])
-        self.assertEqual(mode(self.zd.token_path), 0o600)
-        self.assertEqual(self.zd.token_path.read_text(), '{"access_token": "new", "refresh_token": "r"}')
 
     def webbrowser_url(self):
         return self.open.call_args[0][0]
@@ -355,6 +348,13 @@ class RefreshTests(OAuthTestCase):
     def test_no_refresh_token(self):
         self.zd.token = {"access_token": "old"}
         self.assertFalse(self.zd._refresh("old"))
+
+    def test_a_failed_save_is_not_hidden(self):
+        self.zd.token = {"access_token": "old", "refresh_token": "r"}
+        with mock.patch("urllib.request.urlopen", return_value=reply({"access_token": "new"})), \
+                mock.patch.object(keychain, "save", side_effect=keychain.KeychainError("locked")):
+            with self.assertRaisesRegex(keychain.KeychainError, "locked"):
+                self.zd._refresh("old")
 
     def test_rejected_refresh(self):
         self.zd.token = {"access_token": "old", "refresh_token": "r"}

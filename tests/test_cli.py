@@ -8,9 +8,10 @@ from pathlib import Path
 from unittest import mock
 
 import zd_macro_audit
-from tests.helpers import make_audit, use_macro
+from tests.helpers import fake_keychain, make_audit, use_macro
 from tests.test_auth import mode, modes_while_writing
 from tests.test_fetch import MACRO_PATH, FakeZendesk, audits_path, base_pages, gave_up
+from zdaudit import keychain
 from zdaudit.zendesk import AuthError, Coverage, ZendeskError
 
 NO_ENV = {env: "" for env in zd_macro_audit.ENV_VARS.values()}
@@ -32,6 +33,7 @@ class TempFolderTest(unittest.TestCase):
         patcher = mock.patch.dict(os.environ, NO_ENV)
         patcher.start()
         self.addCleanup(patcher.stop)
+        self.keychain = fake_keychain(self)
 
 
 class SubdomainTests(unittest.TestCase):
@@ -64,8 +66,8 @@ class ConfigTests(TempFolderTest):
         config = self.load(answers=["acme.zendesk.com", "2", "admin@acme.com"], secrets=["abc123"])
         self.assertEqual((config["subdomain"], config["email"], config["api_token"]),
                          ("acme", "admin@acme.com", "abc123"))
-        saved = json.loads(self.path.read_text())
-        self.assertEqual((saved["subdomain"], saved["api_token"]), ("acme", "abc123"))
+        self.assertEqual(json.loads(self.path.read_text()), {"subdomain": "acme", "email": "admin@acme.com"})
+        self.assertEqual(self.keychain, {("acme", "api_token"): "abc123"})
         self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
 
     def test_config_file_is_never_readable_by_others(self):
@@ -76,32 +78,71 @@ class ConfigTests(TempFolderTest):
         self.assertEqual(seen, [0o600])
         self.assertEqual(mode(self.path), 0o600)
         self.assertEqual(self.path.read_text(), json.dumps(
-            {"subdomain": "acme", "email": "admin@acme.com", "api_token": "abc123"}, indent=2) + "\n")
+            {"subdomain": "acme", "email": "admin@acme.com"}, indent=2) + "\n")
+        self.assertEqual(self.keychain, {("acme", "api_token"): "abc123"})
 
     def test_first_run_with_oauth_is_the_default_choice(self):
         config = self.load(answers=["acme", "", "my_client"], secrets=["shh"])
         self.assertEqual((config["client_id"], config["client_secret"], config["api_token"]), ("my_client", "shh", ""))
-        self.assertEqual(json.loads(self.path.read_text())["client_id"], "my_client")
+        self.assertEqual(json.loads(self.path.read_text()), {"subdomain": "acme", "client_id": "my_client"})
+        self.assertEqual(self.keychain, {("acme", "client_secret"): "shh"})
+
+    def test_public_client_clears_an_old_secret(self):
+        self.keychain["acme", "client_secret"] = "old"
+        self.path.write_text(json.dumps({"subdomain": "acme"}))
+        config = self.load("oauth", answers=["my_client"], secrets=[""])
+        self.assertEqual(config["client_secret"], "")
+        self.assertEqual(self.keychain, {})
 
     def test_secrets_are_not_shown_while_typing(self):
         self.load(answers=["acme", "", "my_client"], secrets=["shh"])
         self.getpass.assert_called_once()
 
     def test_saved_token_is_used_without_asking(self):
-        self.path.write_text(json.dumps({"subdomain": "acme", "client_id": "c",
-                                         "email": "a@acme.com", "api_token": "t"}))
+        self.path.write_text(json.dumps({"subdomain": "acme", "client_id": "c", "email": "a@acme.com"}))
+        self.keychain["acme", "api_token"] = "t"
         self.assertEqual(self.load()["api_token"], "t")
 
     def test_saved_oauth_client_is_used_without_asking(self):
-        self.path.write_text(json.dumps({"subdomain": "acme", "client_id": "c", "client_secret": "s"}))
+        self.path.write_text(json.dumps({"subdomain": "acme", "client_id": "c"}))
+        self.keychain["acme", "client_secret"] = "s"
         config = self.load()
         self.assertEqual((config["client_id"], config["client_secret"]), ("c", "s"))
 
+    def test_another_accounts_secrets_are_not_used(self):
+        self.path.write_text(json.dumps({"subdomain": "acme", "client_id": "c"}))
+        self.keychain["other", "client_secret"] = "s"
+        self.assertEqual(self.load()["client_secret"], "")
+
+    def test_secrets_in_the_file_move_to_the_keychain(self):
+        self.path.write_text(json.dumps({"subdomain": "acme", "client_id": "c", "client_secret": "s", "api_token": "t",
+                                         "email": "a@acme.com"}))
+        config = self.load()
+        self.assertEqual((config["client_secret"], config["api_token"]), ("s", "t"))
+        self.assertEqual(self.keychain, {("acme", "client_secret"): "s", ("acme", "api_token"): "t"})
+        self.assertEqual(json.loads(self.path.read_text()), {"subdomain": "acme", "client_id": "c", "email": "a@acme.com"})
+        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+
+    def test_blank_secrets_in_the_file_are_dropped(self):
+        self.path.write_text(json.dumps({"subdomain": "acme", "client_id": "c", "client_secret": "", "api_token": ""}))
+        self.keychain["acme", "client_secret"] = "s"
+        self.assertEqual(self.load()["client_secret"], "s")
+        self.assertEqual(json.loads(self.path.read_text()), {"subdomain": "acme", "client_id": "c"})
+
+    def test_file_keeps_its_secrets_if_the_keychain_fails(self):
+        before = json.dumps({"subdomain": "acme", "client_id": "c", "client_secret": "s"})
+        self.path.write_text(before)
+        with mock.patch.object(keychain, "save", side_effect=keychain.KeychainError("locked")):
+            with self.assertRaisesRegex(keychain.KeychainError, "locked"):
+                self.load()
+        self.assertEqual(self.path.read_text(), before)
+
     def test_oauth_flag_ignores_saved_token(self):
-        self.path.write_text(json.dumps({"subdomain": "acme", "client_id": "c",
-                                         "email": "a@acme.com", "api_token": "t"}))
+        self.path.write_text(json.dumps({"subdomain": "acme", "client_id": "c", "email": "a@acme.com"}))
+        self.keychain["acme", "api_token"] = "t"
         config = self.load("oauth")
         self.assertEqual((config["api_token"], config["client_id"]), ("", "c"))
+        self.assertEqual(self.keychain, {("acme", "api_token"): "t"})
 
     def test_token_flag_asks_for_missing_token(self):
         self.path.write_text(json.dumps({"subdomain": "acme", "client_id": "c"}))
@@ -114,6 +155,7 @@ class ConfigTests(TempFolderTest):
                                           "ZENDESK_API_TOKEN": "t"}):
             self.assertEqual(self.load()["api_token"], "t")
         self.assertFalse(self.path.exists())
+        self.assertEqual(self.keychain, {})
 
     def test_environment_wins_over_the_file_and_is_cleaned_up(self):
         self.path.write_text(json.dumps({"subdomain": "old", "client_id": "c"}))
@@ -162,9 +204,44 @@ class ConfigTests(TempFolderTest):
         with self.assertRaisesRegex(SystemExit, "Missing settings: client_id"):
             self.load(answers=["acme", "", ""], secrets=[""])
         self.assertFalse(self.path.exists())
+        self.assertEqual(self.keychain, {})
+
+    def test_blank_subdomain_stops_the_run(self):
+        with self.assertRaisesRegex(SystemExit, "Missing settings: subdomain"):
+            self.load(answers=[""])
+        self.assertFalse(self.path.exists())
+
+
+class SignOutTests(TempFolderTest):
+    def setUp(self):
+        super().setUp()
+        self.keychain.update({("acme", keychain.OAUTH_TOKEN): "o", ("acme", "client_secret"): "s",
+                              ("acme", "api_token"): "t", ("other", "api_token"): "keep"})
+
+    def test_removes_only_this_accounts_secrets(self):
+        self.path.write_text(json.dumps({"subdomain": "acme"}))
+        with mock.patch("builtins.print"):
+            self.assertEqual(zd_macro_audit.main(["--sign-out", "--config", str(self.path)]), 0)
+        self.assertEqual(self.keychain, {("other", "api_token"): "keep"})
+
+    def test_subdomain_from_the_environment_is_cleaned_up(self):
+        with mock.patch.dict(os.environ, {"ZENDESK_SUBDOMAIN": "https://acme.zendesk.com"}), mock.patch("builtins.print"):
+            zd_macro_audit.main(["--sign-out", "--config", str(self.path)])
+        self.assertEqual(self.keychain, {("other", "api_token"): "keep"})
+
+    def test_no_subdomain(self):
+        with self.assertRaisesRegex(SystemExit, "Nothing to sign out of"):
+            zd_macro_audit.main(["--sign-out", "--config", str(self.path)])
 
 
 class RunTests(TempFolderTest):
+    def setUp(self):
+        super().setUp()
+        # A real .tokens/ next to the tool would add a warning to every run.
+        patcher = mock.patch.object(zd_macro_audit, "HERE", self.dir)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def run_main(self, *args):
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):
@@ -191,7 +268,8 @@ class RunTests(TempFolderTest):
         self.assertEqual((kwargs["until"] - kwargs["since"]).days, 10)
 
     def signed_in(self, fetched=None, error=None):
-        self.path.write_text(json.dumps({"subdomain": "acme", "email": "a@acme.com", "api_token": "t"}))
+        self.path.write_text(json.dumps({"subdomain": "acme", "email": "a@acme.com"}))
+        self.keychain["acme", "api_token"] = "t"
         client = mock.patch.object(zd_macro_audit.zendesk, "Zendesk")
         fetch = mock.patch.object(zd_macro_audit.zendesk, "fetch_all", return_value=fetched, side_effect=error)
         for patcher in (client, fetch):
@@ -221,7 +299,7 @@ class RunTests(TempFolderTest):
 
     def test_sign_in_flags_reach_the_config(self):
         self.signed_in({"audits": [], "macros": {}, "users": {}, "dynamic": {}})
-        self.path.write_text(json.dumps({"subdomain": "acme", "client_id": "c", "email": "a@acme.com", "api_token": "t"}))
+        self.path.write_text(json.dumps({"subdomain": "acme", "client_id": "c", "email": "a@acme.com"}))
         for flag, auth in (("--api-token", "token"), ("--oauth", "oauth")):
             with mock.patch.object(zd_macro_audit, "load_config", wraps=zd_macro_audit.load_config) as load:
                 self.run_main(flag)
@@ -347,7 +425,8 @@ class RunTests(TempFolderTest):
 
     def fake_account(self, errors):
         """A run against made-up Zendesk answers, from sign-in to report."""
-        self.path.write_text(json.dumps({"subdomain": "acme", "email": "a@acme.com", "api_token": "t"}))
+        self.path.write_text(json.dumps({"subdomain": "acme", "email": "a@acme.com"}))
+        self.keychain["acme", "api_token"] = "t"
         fake = FakeZendesk(base_pages(), {audits_path(3): 404, "/api/v2/macros/56.json": 404, **errors})
         fake.authenticate = lambda force=False: None
         # main() picks its own start time, so answer the export whatever second it asks for.
@@ -402,7 +481,8 @@ class RunTests(TempFolderTest):
 
     def test_link_to_another_site_stops_the_run_without_a_traceback(self):
         """A real client, so the check in Zendesk.get is what stops it."""
-        self.path.write_text(json.dumps({"subdomain": "acme", "email": "a@acme.com", "api_token": "t"}))
+        self.path.write_text(json.dumps({"subdomain": "acme", "email": "a@acme.com"}))
+        self.keychain["acme", "api_token"] = "t"
         sent = []
 
         def urlopen(request, timeout=None):
@@ -423,6 +503,35 @@ class RunTests(TempFolderTest):
                          ["https://acme.zendesk.com/api/v2/users/me.json",
                           "https://acme.zendesk.com/api/v2/incremental/tickets/cursor"])
         self.assertFalse((self.dir / "reports").exists())
+
+    def test_real_runs_stop_on_other_systems(self):
+        self.signed_in({"audits": [], "macros": {}, "users": {}, "dynamic": {}})
+        with mock.patch.object(keychain, "supported", return_value=False):
+            for args in ((), ("--sign-out",), ("--api-token",)):
+                code, _, err = self.run_main(*args)
+                self.assertEqual(code, 1)
+                self.assertIn("Windows and Linux aren't available", err)
+        self.client.assert_not_called()
+        self.assertEqual(self.keychain[("acme", "api_token")], "t")
+
+    def test_sample_still_runs_on_other_systems(self):
+        with mock.patch.object(keychain, "supported", return_value=False):
+            code, _, _ = self.run_main("--sample")
+        self.assertEqual(code, 0)
+
+    def test_keychain_error_is_reported(self):
+        self.signed_in()
+        with mock.patch.object(keychain, "load", side_effect=keychain.KeychainError("locked")):
+            code, _, err = self.run_main()
+        self.assertEqual(code, 1)
+        self.assertIn("Error: locked", err)
+
+    def test_old_plain_text_sign_in_gets_a_warning(self):
+        self.signed_in({"audits": [], "macros": {}, "users": {}, "dynamic": {}})
+        with mock.patch.object(zd_macro_audit, "HERE", self.dir):
+            self.assertNotIn("old sign-in", self.run_main()[1])
+            (self.dir / ".tokens").mkdir()
+            self.assertIn("old sign-in", self.run_main()[1])
 
     def test_sign_in_error_is_reported(self):
         self.signed_in(error=AuthError("nope"))
