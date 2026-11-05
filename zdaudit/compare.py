@@ -1,38 +1,73 @@
-"""Compare the text an agent sent with the text a macro inserts.
+"""Work out which words of a sent comment came from which macro.
 
-A use counts as unedited when the macro text appears intact anywhere in the sent
-comment, whatever the agent wrote around it. Differences in whitespace, formatting marks (bold, links, list bullets) and
-curly versus straight quotes are ignored. Placeholders such as
-{{ticket.requester.first_name}} match any text, because Zendesk fills them in
-before it saves the comment. Dynamic content placeholders ({{dc.name}}) match
-any of that item's variants when we know them.
+Each macro is compiled into fixed text and gaps for its placeholders, then
+aligned against the comment's words. A word is only ever credited to one macro.
+Everything else follows from that alignment:
+
+- A macro is intact when all of its fixed text appears, in order and unbroken.
+- Its similarity score is the share of its fixed words that were found.
+- Text was added when words are left over that no macro claimed.
+
+Differences in whitespace, formatting marks (bold, links, list bullets) and
+curly versus straight quotes are ignored. A placeholder may only fill a limited
+number of words, so a long filled-in value can count as an edit. That's on
+purpose: it's better to flag one than to let added text pass as part of a
+placeholder.
 """
 from __future__ import annotations
 
 import html
-import itertools
 import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from html.parser import HTMLParser
 
-# Liquid blocks ({% if %}...{% endif %}) come first so their contents are
-# treated as part of the placeholder, since they may or may not appear.
-PLACEHOLDER = re.compile(
-    r"\{%-?\s*(?P<tag>if|unless|case|for|capture)\b.*?\{%-?\s*end(?P=tag)\s*-?%\}"
-    r"|\{\{.*?\}\}"
-    r"|\{%.*?%\}",
-    re.S,
+# How many words each kind of placeholder may fill. The first match wins.
+GAP_LIMITS = (
+    (re.compile(r"comment|description"), 200),
+    (re.compile(r"signature"), 40),
+    (re.compile(r"url|link|title|subject"), 15),
+    (re.compile(r"email"), 8),
+    (re.compile(r"phone"), 6),
+    (re.compile(r"first_name|last_name"), 3),
+    (re.compile(r"name"), 6),
+    (re.compile(r"(?:^|[._])id$"), 3),
 )
-_DC = re.compile(r"\{\{\s*(dc\.[\w.-]+)\s*\}\}", re.I)
+DEFAULT_GAP = 5
+UNKNOWN_DC_GAP = 100   # dynamic content we couldn't read could be any length
+LOOP_GAP = 30          # {% for %} repeats its contents an unknown number of times
+MAX_DC_DEPTH = 3       # dynamic content can include other dynamic content
+MAX_PLACEMENTS = 50    # places to consider for one macro in one comment, to bound the search
+
+_TAG = re.compile(r"\{\{.*?\}\}|\{%.*?%\}", re.S)
+_TAG_NAME = re.compile(r"\{%-?\s*(\w+)")
+_PLACEHOLDER_NAME = re.compile(r"\{\{-?\s*([\w.-]+)")
 _SLOT = re.compile(r"\x00(\d+)\x00")
+_HTML_TAG = re.compile(
+    r"</?(?:p|div|br|ul|ol|li|span|strong|b|i|u|s|em|a|h[1-6]|blockquote|table|tr|td|th|img|hr|pre|code)\b[^>]*>",
+    re.I,
+)
+
+# Liquid blocks whose contents may render, and those that never render.
+_CHOICE_BLOCKS = {"if", "unless", "case"}
+_BLOCKS = _CHOICE_BLOCKS | {"for", "capture", "comment"}
+
+# Letters, digits and punctuation are separate tokens, so "Hi {{name}}," lines
+# up with "Hi Sam,". Chinese, Japanese and Korean characters are one token each.
+_TOKEN = re.compile(r"[぀-ヿ㐀-鿿가-힯]|\d+|[^\W\d_]+|\S")
 
 _CHAR_MAP = str.maketrans({
     "‘": "'", "’": "'", "“": '"', "”": '"',
-    " ": " ", "​": "",
+    "\xa0": " ",
+    "​": "", "‌": "", "‍": "", "⁠": "", "﻿": "", "\xad": "",
 })
-_MD_LINK = re.compile(r"!?\[([^\]]*)\]\([^)]*\)")
-_MD_MARKS = re.compile(r"\*\*|__|~~")
+_MD_ESCAPE = re.compile(r"\\([\\`*_{}\[\]()#+.!>-])")
+_MD_IMAGE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+_MD_LINK = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+_MD_RULE = re.compile(r"^[ \t]*(?:-{3,}|\*{3,}|_{3,})[ \t]*$", re.M)
+_MD_MARKS = re.compile(r"\*\*|__|~~|`")
+_MD_STAR = re.compile(r"(?<![\w*])\*(?=\S)([^*\n]+?)(?<=\S)\*(?![\w*])")
+_MD_UNDERSCORE = re.compile(r"(?<![\w_])_(?=\S)([^_\n]+?)(?<=\S)_(?![\w_])")
 _LINE_MARKS = re.compile(r"^[ \t]*(?:#{1,6}[ \t]+|>[ \t]?|[-*+•][ \t]+|\d+[.)][ \t]+)", re.M)
 
 
@@ -67,116 +102,355 @@ def html_to_text(markup: str) -> str:
 
 def normalize(text: str) -> str:
     text = html.unescape(text).translate(_CHAR_MAP)
+    text = _MD_ESCAPE.sub(r"\1", text)
+    text = _MD_IMAGE.sub("", text)
     text = _MD_LINK.sub(r"\1", text)
+    text = _MD_RULE.sub("", text)
     text = _MD_MARKS.sub("", text)
+    text = _MD_STAR.sub(r"\1", text)
+    text = _MD_UNDERSCORE.sub(r"\1", text)
     text = _LINE_MARKS.sub("", text)
     return " ".join(text.split())
 
 
+def _is_word(token: str) -> bool:
+    return token[0].isalnum()
+
+
+# ---- The comment -------------------------------------------------------------
+
+class _Comment:
+    def __init__(self, sent: str):
+        self.text = normalize(sent)
+        found = list(_TOKEN.finditer(self.text))
+        self.tokens = tuple(m.group(0) for m in found)
+        self.spans = [m.span() for m in found]
+        self.is_word = [_is_word(t) for t in self.tokens]
+
+    def without(self, claimed: list[tuple[int, int]]) -> list[str]:
+        """The comment's words, leaving out the given ranges of tokens."""
+        pieces, position = [], 0
+        for start, end in sorted(claimed):
+            pieces.append(self.text[position:self.spans[start][0]])
+            position = self.spans[end - 1][1]
+        pieces.append(self.text[position:])
+        return " ".join(pieces).split()
+
+
+# ---- What a macro compiles to --------------------------------------------------
+
 @dataclass
-class Template:
-    pattern: re.Pattern
-    literal_words: list[str]   # macro words with placeholders left out, for scoring
-    display_words: list[str]   # macro words with placeholders kept, for diffs
+class _Literal:
+    tokens: tuple[str, ...]
+
+    def ends(self, comment: _Comment, start: int) -> set[int]:
+        end = start + len(self.tokens)
+        return {end} if comment.tokens[start:end] == self.tokens else set()
 
 
-def _parse(text: str, dynamic: dict[str, list[str]], depth: int = 0) -> tuple[str, list[str], list[str]]:
-    """Return (regex source, literal words, display words) for one macro text."""
-    slots: list[str] = []
+@dataclass
+class _Gap:
+    max_words: int
 
-    def stash(match: re.Match) -> str:
-        slots.append(match.group(0))
-        return f"\x00{len(slots) - 1}\x00"
+    def ends(self, comment: _Comment, start: int) -> set[int]:
+        found, words = {start}, 0
+        for i in range(start, len(comment.tokens)):
+            words += comment.is_word[i]
+            if words > self.max_words:
+                break
+            found.add(i + 1)
+        return found
 
-    pieces = _SLOT.split(normalize(PLACEHOLDER.sub(stash, text)))
-    regex: list[str] = []
-    literal: list[str] = []
-    display: list[str] = []   # pieces of the display text, split into words at the end
-    for i, piece in enumerate(pieces):
-        if i % 2:  # a placeholder
-            slot = slots[int(piece)]
-            dc = _DC.fullmatch(slot.strip())
-            variants = dynamic.get(dc.group(1).lower()) if dc and depth < 3 else None
-            if variants:
-                parsed = [_parse(v, dynamic, depth + 1) for v in variants]
-                regex.append("(?:" + "|".join(p[0] for p in parsed) + ")")
-                literal.extend(parsed[0][1])
-                display.append(" ".join(parsed[0][2]))
-            else:
-                regex.append(".*?")
-                display.append(_compact(slot))
+
+@dataclass
+class _Choice:
+    options: list[list]
+
+    def ends(self, comment: _Comment, start: int) -> set[int]:
+        found: set[int] = set()
+        for option in self.options:
+            found |= _sequence_ends(option, comment, start)
+        return found
+
+
+def _sequence_ends(parts: list, comment: _Comment, start: int) -> set[int]:
+    """Every position in the comment where this run of parts could finish."""
+    ends = {start}
+    for part in parts:
+        ends = {after for end in ends for after in part.ends(comment, end)}
+        if not ends:
+            break
+    return ends
+
+
+def _required_words(parts: list) -> int:
+    """How many fixed words must appear, whichever options are taken."""
+    total = 0
+    for part in parts:
+        if isinstance(part, _Literal):
+            total += sum(_is_word(t) for t in part.tokens)
+        elif isinstance(part, _Choice):
+            total += min(_required_words(option) for option in part.options)
+    return total
+
+
+def _fixed_words(parts: list, available: set[str]) -> list[str]:
+    """The macro's fixed words, taking the option closest to what was sent."""
+    words: list[str] = []
+    for part in parts:
+        if isinstance(part, _Literal):
+            words.extend(t for t in part.tokens if _is_word(t))
+        elif isinstance(part, _Choice):
+            options = [_fixed_words(option, available) for option in part.options]
+            words.extend(max(options, key=lambda o: (len(available.intersection(o)), -len(o))))
+    return words
+
+
+# ---- Reading a macro's text ----------------------------------------------------
+
+@dataclass
+class _Placeholder:
+    source: str
+
+
+@dataclass
+class _Block:
+    tag: str
+    branches: list[list]
+    has_else: bool = False
+
+
+def _parse_tree(text: str) -> list:
+    """Split text into strings, placeholders and (possibly nested) Liquid blocks."""
+    root: list = []
+    current = root
+    stack: list[tuple[_Block, list]] = []
+    position = 0
+    for match in _TAG.finditer(text):
+        if match.start() > position:
+            current.append(text[position:match.start()])
+        position = match.end()
+        source = match.group(0)
+        if source.startswith("{{"):
+            current.append(_Placeholder(source))
             continue
-        # Literal text. A space next to a placeholder is optional, because the
-        # placeholder may render as nothing and leave a single space behind.
-        core, lead, trail = piece, "", ""
-        if i > 0 and core.startswith(" "):
-            core, lead = core[1:], " ?"
-        if i < len(pieces) - 1 and core.endswith(" "):
-            core, trail = core[:-1], " ?"
-        regex.append(lead + re.escape(core) + trail)
-        literal.extend(core.split())
-        display.append(piece)
-    return "".join(regex), literal, "".join(display).split()
+        name_match = _TAG_NAME.match(source)
+        name = name_match.group(1) if name_match else ""
+        if name in _BLOCKS:
+            block = _Block(name, [] if name == "case" else [[]])
+            current.append(block)
+            stack.append((block, current))
+            current = block.branches[-1] if block.branches else []  # text before {% when %} never renders
+        elif name in ("elsif", "else", "when") and stack:
+            block = stack[-1][0]
+            block.has_else = block.has_else or name == "else"
+            block.branches.append([])
+            current = block.branches[-1]
+        elif name.startswith("end") and any(block.tag == name[3:] for block, _ in stack):
+            while True:
+                block, current = stack.pop()
+                if block.tag == name[3:]:
+                    break
+    if position < len(text):
+        current.append(text[position:])
+    return root
 
 
-def _compact(slot: str) -> str:
-    """A placeholder as one word, so it lines up with the word it turned into."""
-    if slot.startswith("{%"):
-        # Liquid output usually starts its own sentence, so keep it a separate word.
-        tag = re.match(r"\{%-?\s*(\w+)", slot)
-        return " {%" + (tag.group(1) if tag else "") + "…%} "
-    return "".join(slot.split())
+def _gap_limit(source: str) -> int:
+    match = _PLACEHOLDER_NAME.match(source)
+    name = match.group(1).lower() if match else ""
+    if name.startswith("dc."):
+        return UNKNOWN_DC_GAP
+    return next((limit for pattern, limit in GAP_LIMITS if pattern.search(name)), DEFAULT_GAP)
+
+
+def _compile_placeholder(node: _Placeholder, dynamic: dict[str, list[str]], depth: int) -> tuple[list, str]:
+    match = _PLACEHOLDER_NAME.match(node.source)
+    name = match.group(1).lower() if match else ""
+    variants = dynamic.get(name) if name.startswith("dc.") and depth < MAX_DC_DEPTH else None
+    if not variants:
+        return [_Gap(_gap_limit(node.source))], "".join(node.source.split())
+    # A variant may be stored as HTML, which needs the same treatment as a rich text macro.
+    compiled = [
+        _compile_nodes(_parse_tree(html_to_text(v) if _HTML_TAG.search(v) else v), dynamic, depth + 1)
+        for v in variants
+    ]
+    return [_Choice([parts for parts, _ in compiled])], compiled[0][1]
+
+
+def _compile_block(node: _Block, dynamic: dict[str, list[str]], depth: int) -> tuple[list, str]:
+    label = f" {{%{node.tag}…%}} "   # Liquid output usually starts its own sentence
+    if node.tag == "for":
+        return [_Gap(LOOP_GAP)], label
+    if node.tag in _CHOICE_BLOCKS:
+        options = [_compile_nodes(branch, dynamic, depth)[0] for branch in node.branches]
+        if not node.has_else:
+            options.append([])
+        return [_Choice(options)], label
+    return [], ""  # {% capture %} and {% comment %} render nothing
+
+
+def _compile_nodes(nodes: list, dynamic: dict[str, list[str]], depth: int) -> tuple[list, str]:
+    """Return (parts, display text). Text is normalized as a whole, with slots for the rest."""
+    slots: list = []
+    joined: list[str] = []
+    for node in nodes:
+        if isinstance(node, str):
+            joined.append(node)
+        else:
+            joined.append(f"\x00{len(slots)}\x00")
+            slots.append(node)
+
+    parts: list = []
+    display: list[str] = []
+    for i, piece in enumerate(_SLOT.split(normalize("".join(joined)))):
+        if i % 2 == 0:
+            tokens = tuple(_TOKEN.findall(piece))
+            if tokens:
+                parts.append(_Literal(tokens))
+            display.append(piece)
+            continue
+        node = slots[int(piece)]
+        compile_slot = _compile_placeholder if isinstance(node, _Placeholder) else _compile_block
+        slot_parts, slot_display = compile_slot(node, dynamic, depth)
+        parts.extend(slot_parts)
+        display.append(slot_display)
+    return parts, "".join(display)
+
+
+@dataclass
+class Macro:
+    core: list                 # parts from the first to the last that isn't a placeholder gap
+    lead_words: int            # words the placeholders before the core can fill
+    trail_words: int           # words the placeholders after the core can fill
+    display_words: list[str]   # macro words with placeholders kept, for diffs
+    required_words: int
+
+    @property
+    def comparable(self) -> bool:
+        """False when nothing but placeholders is certain, so any comment could match."""
+        return self.required_words > 0
+
+
+def compile_macro(text: str, dynamic: dict[str, list[str]] | None = None) -> Macro:
+    parts, display = _compile_nodes(_parse_tree(text), dynamic or {}, 0)
+    first = next((i for i, part in enumerate(parts) if not isinstance(part, _Gap)), len(parts))
+    last = next((i for i in range(len(parts), first, -1) if not isinstance(parts[i - 1], _Gap)), first)
+    return Macro(
+        parts[first:last],
+        sum(part.max_words for part in parts[:first]),
+        sum(part.max_words for part in parts[last:]),
+        display.split(),
+        _required_words(parts),
+    )
 
 
 def is_placeholder(word: str) -> bool:
     return "{{" in word or "{%" in word
 
 
-def build_template(text: str, dynamic: dict[str, list[str]] | None = None) -> Template:
-    source, literal, display = _parse(text, dynamic or {})
-    # The boundaries stop "Thanks" from matching inside "Thanksgiving".
-    return Template(re.compile(rf"(?<!\w)(?:{source})(?!\w)", re.S), literal, display)
+# ---- Comparing ---------------------------------------------------------------
+
+@dataclass
+class MacroResult:
+    intact: bool
+    similarity: float  # 0 to 100, the share of the macro's fixed words found in the comment
+    diff: list[tuple[str, list[str]]] | None = None
 
 
 @dataclass
 class Comparison:
-    matched: bool      # every macro's text appears intact in the sent comment
-    similarity: float  # 0 to 100, the share of the macro's words kept, where 100 means all of them
-    template: Template
-    added_text: bool = False  # matched, and the agent also wrote text around the macro
+    results: list[MacroResult]  # one per macro, in the order given
+    added_text: bool            # words are left over that no macro accounts for
 
 
-def _words_kept(macro_words: list[str], sent_words: list[str]) -> float:
-    """Share of the macro's words kept in order. Text the agent added doesn't lower it."""
-    if not macro_words:
-        return 0.0
-    matcher = SequenceMatcher(None, macro_words, sent_words, autojunk=False)
-    return sum(block.size for block in matcher.get_matching_blocks()) / len(macro_words)
+def _candidates(macro: Macro, comment: _Comment) -> list[tuple[int, int]]:
+    """Each (start, end) range of tokens where this macro's core could sit, longest kept first."""
+    found = []
+    for start in range(len(comment.tokens)):
+        found.extend((start, end) for end in _sequence_ends(macro.core, comment, start) if end > start)
+    found.sort(key=lambda r: (r[0] - r[1], r[0]))
+    return sorted(found[:MAX_PLACEMENTS])
 
 
-def compare(macro_texts: list[str], sent: str, dynamic: dict[str, list[str]] | None = None) -> Comparison:
-    """Compare sent text against one or more macro texts applied in the same update.
+def _extend(comment: _Comment, claimed: list[bool], start: int, end: int, macro: Macro) -> tuple[int, int]:
+    """Widen a placed macro over free text its outer placeholders could have filled."""
+    if macro.lead_words:
+        words = 0
+        while start > 0 and not claimed[start - 1] and words + comment.is_word[start - 1] <= macro.lead_words:
+            start -= 1
+            words += comment.is_word[start]
+    if macro.trail_words:
+        words = 0
+        while end < len(claimed) and not claimed[end] and words + comment.is_word[end] <= macro.trail_words:
+            words += comment.is_word[end]
+            end += 1
+    return start, end
 
-    When several macros were applied, each one's text must appear intact, in
-    any order. For a comment that is nothing but macro text, or for scoring an
-    edit, their texts are joined in each order (up to three macros).
+
+def _place(candidates: list[list[tuple[int, int]]]) -> dict[int, tuple[int, int]]:
+    """Give each macro its own range of the comment, with no word shared.
+
+    Tries every arrangement. It keeps the most macros intact, then accounts for
+    the most text, so the result doesn't depend on the order macros were applied.
     """
-    macro_texts = list(dict.fromkeys(macro_texts))  # a macro applied twice only needs to appear once
-    sent_norm = normalize(sent)
-    sent_words = sent_norm.split()
-    orders = itertools.permutations(macro_texts) if len(macro_texts) <= 3 else [macro_texts]
-    best: Comparison | None = None
-    for order in orders:
-        template = build_template("\n\n".join(order), dynamic)
-        if template.pattern.fullmatch(sent_norm):
-            return Comparison(True, 100.0, template)
-        score = min(round(_words_kept(template.literal_words, sent_words) * 100, 1), 99.9)
-        if best is None or score > best.similarity:
-            best = Comparison(False, score, template)
-    assert best is not None
-    if all(build_template(text, dynamic).pattern.search(sent_norm) for text in macro_texts):
-        return Comparison(True, 100.0, best.template, added_text=True)
-    return best
+    memo: dict[tuple[int, int], tuple[int, int, tuple]] = {}
+
+    def best(position: int, used: int) -> tuple[int, int, tuple]:
+        key = (position, used)
+        if key not in memo:
+            result = (0, 0, ())
+            for index, ranges in enumerate(candidates):
+                if used >> index & 1:
+                    continue
+                for start, end in ranges:
+                    if start >= position:
+                        placed, covered, rest = best(end, used | 1 << index)
+                        option = (placed + 1, covered + end - start, ((index, start, end), *rest))
+                        if option[:2] > result[:2]:
+                            result = option
+            memo[key] = result
+        return memo[key]
+
+    return {index: (start, end) for index, start, end in best(0, 0)[2]}
+
+
+def compare(macros: list[Macro], sent: str) -> Comparison:
+    """Compare the sent text against every macro applied in the same update."""
+    comment = _Comment(sent)
+    placed = _place([_candidates(macro, comment) for macro in macros])
+    claimed = [False] * len(comment.tokens)
+    for start, end in placed.values():
+        claimed[start:end] = [True] * (end - start)
+    # Outer placeholders only get text that no macro's fixed text needs.
+    for index, (start, end) in placed.items():
+        placed[index] = _extend(comment, claimed, start, end, macros[index])
+        start, end = placed[index]
+        claimed[start:end] = [True] * (end - start)
+    remaining = comment.without(list(placed.values()))
+
+    results: list[MacroResult | None] = [
+        MacroResult(True, 100.0) if index in placed else None for index in range(len(macros))
+    ]
+    # Score edited macros largest first, so a word only counts toward one of them.
+    edited = [index for index, result in enumerate(results) if result is None]
+    available = {comment.tokens[i] for i in range(len(claimed)) if not claimed[i]}
+    fixed = {index: _fixed_words(macros[index].core, available) for index in edited}
+    for index in sorted(edited, key=lambda i: -len(fixed[i])):
+        open_words = [i for i in range(len(claimed)) if comment.is_word[i] and not claimed[i]]
+        matcher = SequenceMatcher(None, fixed[index], [comment.tokens[i] for i in open_words], autojunk=False)
+        kept = 0
+        for block in matcher.get_matching_blocks():
+            kept += block.size
+            for i in open_words[block.b:block.b + block.size]:
+                claimed[i] = True
+        share = kept / len(fixed[index]) if fixed[index] else 0.0
+        results[index] = MacroResult(
+            False, min(round(share * 100, 1), 99.9), word_diff(macros[index].display_words, remaining),
+        )
+
+    added = any(comment.is_word[i] and not claimed[i] for i in range(len(claimed)))
+    return Comparison(results, added)
 
 
 def word_diff(before: list[str], after: list[str]) -> list[tuple[str, list[str]]]:

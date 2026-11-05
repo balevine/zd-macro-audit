@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from statistics import mean
 
-from .compare import Comparison, build_template, compare, html_to_text, normalize, word_diff
+from .compare import compare, compile_macro, html_to_text
 from .zendesk import is_macro_event, parse_time
 
 # Only these two statuses count toward the edited percentage.
@@ -16,12 +16,14 @@ STATUS_LABELS = {
     "unedited": "Kept intact",
     "edited": "Edited",
     "no_text": "Macro has no comment text",
+    "only_placeholders": "Macro is only placeholders",
     "unavailable": "Macro deleted or unreadable",
     "changed": "Macro changed since use",
 }
 
 STATUS_HELP = {
     "no_text": "The macro only changes fields or tags, so there's no text to compare.",
+    "only_placeholders": "All of the macro's text is filled in by Zendesk, so any comment could match it.",
     "unavailable": "The macro was deleted or this account can't read it, so its text is unknown.",
     "changed": "The comment doesn't match, but the macro was edited after this use. "
                "Zendesk only gives us the current version, so we can't tell.",
@@ -82,6 +84,7 @@ def agent_name(users: dict[str, dict], agent_id: str) -> str:
 def analyze(audits: list[dict], macros: dict[str, dict], users: dict[str, dict],
             dynamic: dict[str, list[str]], since: datetime, until: datetime) -> Result:
     texts = {mid: macro_text(m) for mid, m in macros.items()}
+    compiled = {mid: compile_macro(text, dynamic) for mid, text in texts.items() if text}
     uses: list[Use] = []
 
     for audit in sorted(audits, key=lambda a: a["created_at"]):
@@ -96,41 +99,38 @@ def analyze(audits: list[dict], macros: dict[str, dict], users: dict[str, dict],
             for e in refs
         }
 
-        missing = any(mid not in macros for mid in ref_ids)
-        with_text = [texts[mid] for mid in ref_ids if mid in macros and texts[mid]]
-        comparison = diff = None
-        if not missing and with_text and comment is None:
-            # The macro put text in the reply box, but the update was saved
-            # without a comment, so the agent deleted all of it.
-            template = build_template("\n\n".join(with_text), dynamic)
-            comparison = Comparison(False, 0.0, template)
-            diff = [("delete", template.display_words)]
-        elif not missing and with_text:
-            body = comment.get("body") or ""
-            comparison = compare(with_text, body, dynamic)
-            if not comparison.matched:
-                diff = word_diff(comparison.template.display_words, normalize(body).split())
-        changed_since = any(
-            macros[mid].get("updated_at") and parse_time(macros[mid]["updated_at"]) > created
-            for mid in ref_ids if mid in macros
-        )
+        # Each macro gets its own result. A macro applied twice is compared once.
+        to_compare = [mid for mid in dict.fromkeys(ref_ids) if mid in compiled and compiled[mid].comparable]
+        comparison = results = None
+        if comment is not None and to_compare:
+            comparison = compare([compiled[mid] for mid in to_compare], comment.get("body") or "")
+            results = dict(zip(to_compare, comparison.results))
+        # Text from a macro we can't read would look like text the agent added.
+        added_text = bool(comparison and comparison.added_text) and all(mid in macros for mid in ref_ids)
 
         for mid in ref_ids:
+            similarity = diff = None
             if mid not in macros:
                 status = "unavailable"
             elif not texts[mid]:
                 status = "no_text"
-            elif missing:
-                status = "unavailable"   # combined with a macro whose text we can't read
+            elif not compiled[mid].comparable:
+                status = "only_placeholders"
             elif comment is None:
-                status = "edited"        # all of the macro's text was deleted
-            elif comparison.matched:
-                status = "unedited"
-            elif changed_since:
-                status = "changed"
+                # The macro put text in the reply box, but the update was saved
+                # without a comment, so the agent deleted all of it.
+                status, similarity = "edited", 0.0
+                diff = [("delete", compiled[mid].display_words)]
             else:
-                status = "edited"
-            has_score = status in ("edited", "unedited", "changed")
+                result = results[mid]
+                similarity, diff = result.similarity, result.diff
+                updated_at = macros[mid].get("updated_at")
+                if result.intact:
+                    status = "unedited"
+                elif updated_at and parse_time(updated_at) > created:
+                    status = "changed"
+                else:
+                    status = "edited"
             uses.append(Use(
                 audit_id=audit["id"],
                 ticket_id=audit["ticket_id"],
@@ -140,10 +140,10 @@ def analyze(audits: list[dict], macros: dict[str, dict], users: dict[str, dict],
                 macro_title=titles[mid],
                 comment_type=comment_type,
                 status=status,
-                similarity=comparison.similarity if has_score else None,
+                similarity=similarity,
                 combined_with=[titles[o] for o in ref_ids if o != mid],
-                diff=diff if status in ("edited", "changed") else None,
-                added_text=status == "unedited" and comparison.added_text,
+                diff=diff,
+                added_text=status == "unedited" and added_text,
             ))
 
     return Result(since, until, uses, users, _overall(uses), _by_agent(uses, users), _by_macro(uses, macros))

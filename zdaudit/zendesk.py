@@ -15,6 +15,7 @@ import hashlib
 import http.server
 import json
 import os
+import re
 import secrets
 import threading
 import time
@@ -433,7 +434,7 @@ def fetch_all(zd: Zendesk, since: datetime, log: Callable[[str], None] = print, 
     log(f"Fetching {len(macro_ids):,} macros...")
     macros = fetch_macros(zd, macro_ids)
     dynamic: dict[str, list[str]] = {}
-    if any("{{dc." in json.dumps(m.get("actions", [])) for m in macros.values()):
+    if any(re.search(r"\{\{-?\s*dc\.", json.dumps(m.get("actions", []))) for m in macros.values()):
         log("Fetching dynamic content used in macros...")
         dynamic = fetch_dynamic_content(zd)
     log("Fetching agent names...")

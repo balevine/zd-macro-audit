@@ -134,24 +134,42 @@ A use counts as **kept intact** when the macro's text appears unchanged anywhere
 
 "Unchanged" allows for these exceptions.
 
-- **Placeholders** like `{{ticket.requester.first_name}}` match whatever Zendesk filled in. Filling in a name is never an edit.
+- **Placeholders** like `{{ticket.requester.first_name}}` match what Zendesk filled in, up to the limits below.
 - **Dynamic content** like `{{dc.sign_off}}` matches any of its language versions.
-- **Liquid blocks** like `{% if %}...{% endif %}` match whether or not their text appears.
-- **Spacing, bold, links, list bullets and curly quotes** are ignored, because the editor changes these on its own.
+- **Liquid blocks** like `{% if %}...{% else %}...{% endif %}` match any of their branches exactly, or nothing if there's no `else`. Rewriting a branch counts as an edit.
+- **Spacing, bold, italics, links, images, list bullets, curly quotes and invisible characters** are ignored, because the editor changes these on its own.
+
+### How much a placeholder can fill
+
+Zendesk doesn't record what it filled in, so the tool limits how many words each placeholder can stand for. Without a limit, a paragraph typed next to a placeholder would look like part of it.
+
+| Placeholder name contains | Words it can fill |
+| --- | --- |
+| `comment`, `description` | 200 |
+| `signature` | 40 |
+| `url`, `link`, `title`, `subject` | 15 |
+| `email` | 8 |
+| `phone` | 6 |
+| `first_name`, `last_name` | 3 |
+| `name` | 6 |
+| Ends in `id` | 3 |
+| Anything else, including custom fields | 5 |
+| A `{% for %}` loop | 30 |
+| `{{dc.*}}` that couldn't be read | 100 |
+
+The limits lean toward flagging. A value longer than its limit counts as an edit even if the agent didn't touch it, because that's better than missing text an agent added. Added text that fits within a limit can still pass as part of the placeholder. To change a limit, edit `GAP_LIMITS` in `zdaudit/compare.py`.
 
 Every other change inside the macro's text counts as an edit, however small, including text added in the middle of it. Each use also gets a **similarity score**, which shows how much of the macro's wording the agent kept. 100% means it was kept intact. A fixed typo scores in the high 90s, and a full rewrite scores much lower. Text added around the macro doesn't lower the score.
-
-Text added right next to a placeholder can't be told apart from what Zendesk filled in, so it doesn't count as an edit.
-
 If a macro adds text but the agent saved the update with no comment, they deleted all of the macro's text. That counts as edited, with 0% similarity. The report lists these uses as "No comment".
 
-If an agent applied several macros in one update, all of their text must appear intact, in any order, for any of them to count as kept intact. Each macro counts as one use.
+If an agent applied several macros in one update, each one is judged on its own, and their text can appear in any order. Each macro counts as one use. A word in the comment can only be credited to one macro, so two macros that share a sentence need that sentence to appear twice to both count as kept intact. When only one copy appears, the macro left without it counts as edited.
 
 ### Uses that aren't counted
 
 Some uses can't be judged, so they're left out of the percentages and listed separately in the report.
 
 - **Macro has no comment text.** The macro only sets fields or tags.
+- **Macro is only placeholders.** All of its text is filled in by Zendesk, for example a macro that's just `{{dc.reply}}` when that item can't be read, so any comment could match it.
 - **Macro deleted or unreadable.** The macro no longer exists, so its text is unknown.
 - **Macro changed since use.** Zendesk only gives the current version of a macro. If someone edited the macro during the period, older uses that don't match it can't be judged.
 
@@ -168,7 +186,7 @@ Some uses can't be judged, so they're left out of the percentages and listed sep
 | --- | --- |
 | `zd_macro_audit.py` | The command you run. |
 | `zdaudit/zendesk.py` | OAuth and API token sign-in, and the Zendesk API calls. |
-| `zdaudit/compare.py` | Decides whether a comment matches a macro, and scores similarity. |
+| `zdaudit/compare.py` | Works out which words of a comment came from which macro, and scores similarity. |
 | `zdaudit/analyze.py` | Turns raw data into per-use results and totals. |
 | `zdaudit/report.py` | Writes the HTML report and CSV files. |
 | `zdaudit/sample.py` | The made-up data behind `--sample`. |

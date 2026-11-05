@@ -258,7 +258,7 @@ def render_html(result: Result, subdomain: str | None) -> str:
     excluded_rows = "".join(
         f"<tr><td>{escape(STATUS_LABELS[s])}</td><td class='r'>{o['excluded'].get(s, 0):,}</td>"
         f"<td class='muted'>{escape(STATUS_HELP[s])}</td></tr>"
-        for s in ("no_text", "unavailable", "changed")
+        for s in ("no_text", "only_placeholders", "unavailable", "changed")
     )
 
     # Zendesk's usage counts always cover the last 30 days, and need the Professional plan or above.
@@ -461,11 +461,11 @@ ins {{ background:var(--ins-bg); color:var(--ins); text-decoration:none; border-
   <h2>How this was measured</h2>
   <ul class="notes muted">
     <li>A macro use is any update where Zendesk recorded that an agent applied a macro. The text saved in that same update is compared with the macro's comment text.</li>
-    <li>Placeholders such as <code>{{{{ticket.requester.first_name}}}}</code> match whatever Zendesk filled in, so they never count as edits. Dynamic content matches any of its language versions.</li>
+    <li>Placeholders such as <code>{{{{ticket.requester.first_name}}}}</code> match what Zendesk filled in, up to a limit that depends on the placeholder (three words for a first name). A longer value counts as an edit, so a few long filled-in values may be flagged by mistake. Dynamic content matches any of its language versions.</li>
     <li>A use counts as kept intact when the macro's text appears anywhere in the saved text, so a greeting or signature added around it isn't an edit. These uses are marked "with text added".</li>
     <li>Changes to spacing, bold, links, list bullets and curly quotes are ignored. Any other change inside the macro's text counts as an edit, however small. Similarity shows how much of the macro's wording was kept.</li>
     <li>If a macro adds text but the update was saved with no comment, the agent deleted all of the macro's text. That counts as edited, with 0% similarity.</li>
-    <li>If several macros were applied in one update, all of their text must be intact for any of them to count as kept intact. Each macro is counted as a use.</li>
+    <li>If several macros were applied in one update, each one is judged on its own and counted as a use. A word in the saved text can only be credited to one macro.</li>
     <li>Zendesk only returns a macro's current text. If a macro changed during this period, older uses that don't match are listed as "Macro changed since use" instead of being counted.</li>
   </ul>
 </main>
