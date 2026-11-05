@@ -57,6 +57,8 @@ _BLOCKS = _CHOICE_BLOCKS | {"for", "capture", "comment"}
 # up with "Hi Sam,". Chinese, Japanese and Korean characters are one token each.
 _TOKEN = re.compile(r"[぀-ヿ㐀-鿿가-힯]|\d+|[^\W\d_]+|\S")
 
+_WORD_JOINERS = {"-", "'"}
+
 _CHAR_MAP = str.maketrans({
     "‘": "'", "’": "'", "“": '"', "”": '"',
     "\xa0": " ",
@@ -127,6 +129,12 @@ class _Comment:
         self.tokens = tuple(m.group(0) for m in found)
         self.spans = [m.span() for m in found]
         self.is_word = [_is_word(t) for t in self.tokens]
+        # Mary-Jane and O'Neil are one word each when counting what a placeholder filled.
+        self.starts_word = [self.is_word[i] and not self._continues_word(i) for i in range(len(self.tokens))]
+
+    def _continues_word(self, i: int) -> bool:
+        return (i >= 2 and self.tokens[i - 1] in _WORD_JOINERS and self.is_word[i - 2]
+                and self.spans[i - 2][1] == self.spans[i - 1][0] and self.spans[i - 1][1] == self.spans[i][0])
 
     def without(self, claimed: list[tuple[int, int]]) -> list[str]:
         """The comment's words, leaving out the given ranges of tokens."""
@@ -156,7 +164,7 @@ class _Gap:
     def ends(self, comment: _Comment, start: int) -> set[int]:
         found, words = {start}, 0
         for i in range(start, len(comment.tokens)):
-            words += comment.is_word[i]
+            words += comment.starts_word[i]
             if words > self.max_words:
                 break
             found.add(i + 1)
@@ -359,7 +367,7 @@ def _outline(parts: list, available: set[str]) -> list:
     return outline
 
 
-def _pct_of_macro(outline: list, sent_words: list[str]) -> tuple[float, list[tuple[int, int]]]:
+def _pct_of_macro(outline: list, sent_words: list[str], starts_word: list[bool]) -> tuple[float, list[tuple[int, int]]]:
     """How much of a macro was edited, and which runs of sent words matched it (start, length).
 
     A replaced stretch counts as its longer side. Words inserted where a
@@ -383,7 +391,7 @@ def _pct_of_macro(outline: list, sent_words: list[str]) -> tuple[float, list[tup
             changed += i2 - i1
         else:
             allowed = sum(free.get(i, 0) for i in range(i1, i2 + 1))
-            changed += max(i2 - i1, j2 - j1 - allowed)
+            changed += max(i2 - i1, sum(starts_word[j1:j2]) - allowed)
     # An edited macro never reads 0%, even if only its punctuation changed.
     pct = min(max(round(100 * changed / len(words), 1), 0.1), 100.0)
     return pct, [(block.b, block.size) for block in matcher.get_matching_blocks() if block.size]
@@ -402,13 +410,13 @@ def _extend(comment: _Comment, claimed: list[bool], start: int, end: int, macro:
     """Widen a placed macro over free text its outer placeholders could have filled."""
     if macro.lead_words:
         words = 0
-        while start > 0 and not claimed[start - 1] and words + comment.is_word[start - 1] <= macro.lead_words:
+        while start > 0 and not claimed[start - 1] and words + comment.starts_word[start - 1] <= macro.lead_words:
             start -= 1
-            words += comment.is_word[start]
+            words += comment.starts_word[start]
     if macro.trail_words:
         words = 0
-        while end < len(claimed) and not claimed[end] and words + comment.is_word[end] <= macro.trail_words:
-            words += comment.is_word[end]
+        while end < len(claimed) and not claimed[end] and words + comment.starts_word[end] <= macro.trail_words:
+            words += comment.starts_word[end]
             end += 1
     return start, end
 
@@ -483,7 +491,8 @@ def compare(macros: list[Macro], sent: str) -> Comparison:
     outlines = {index: _outline(macros[index].core, available) for index in edited}
     for index in sorted(edited, key=lambda i: -sum(isinstance(item, str) for item in outlines[i])):
         open_words = [i for i in range(len(claimed)) if comment.is_word[i] and not claimed[i]]
-        pct, matches = _pct_of_macro(outlines[index], [comment.tokens[i] for i in open_words])
+        pct, matches = _pct_of_macro(outlines[index], [comment.tokens[i] for i in open_words],
+                                     [comment.starts_word[i] for i in open_words])
         for start, size in matches:
             for i in open_words[start:start + size]:
                 claimed[i] = True

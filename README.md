@@ -158,6 +158,8 @@ Zendesk doesn't record what it filled in, so the tool limits how many words each
 | A `{% for %}` loop | 30 |
 | `{{dc.*}}` that couldn't be read | 100 |
 
+A hyphenated word or one with an apostrophe, like `Mary-Jane` or `O'Neil`, counts as one word here.
+
 The limits lean toward flagging. A value longer than its limit counts as an edit even if the agent didn't touch it, because that's better than missing text an agent added. Added text that fits within a limit can still pass as part of the placeholder. To change a limit, edit `GAP_LIMITS` in `zdaudit/compare.py`.
 
 Every other change inside the macro's text counts as an edit, however small, including text added in the middle of it. 

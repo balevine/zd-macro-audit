@@ -56,10 +56,30 @@ class PlaceholderTests(CompareBase):
     def test_punctuation_in_a_value_does_not_use_up_the_limit(self):
         self.assertUnedited("Hi {{ticket.requester.first_name}}, done.", "Hi (Mary) Jane, Ann!, done.")
 
-    def test_hyphens_and_apostrophes_split_a_value_into_words(self):
+    def test_hyphenated_and_apostrophe_words_count_once(self):
         macro = "Hi {{ticket.requester.first_name}}, done."
-        self.assertUnedited(macro, "Hi Mary-Jane Ann, done.")
-        self.assertEdited(macro, "Hi Mary-Jane O'Neil, done.")  # counts as four words
+        self.assertUnedited(macro, "Hi Mary-Jane O'Neil Lee, done.")
+        self.assertEdited(macro, "Hi Mary-Jane O'Neil Lee Ann, done.")
+
+    def test_curly_apostrophe_counts_once_too(self):
+        self.assertUnedited("Hi {{ticket.requester.first_name}}, done.", "Hi O’Neil D’Arcy Lee, done.")
+
+    def test_spaced_hyphen_does_not_join_words(self):
+        macro = "Hi {{ticket.requester.first_name}}, done."
+        self.assertUnedited(macro, "Hi Mary - Jane Ann, done.")
+        self.assertEdited(macro, "Hi Mary - Jane Ann Lee, done.")
+        self.assertEdited(macro, "Hi Mary- Jane Ann Lee, done.")
+        self.assertEdited(macro, "Hi Mary -Jane Ann Lee, done.")
+
+    def test_quotes_around_a_word_do_not_join_it(self):
+        macro = "Hi {{ticket.requester.first_name}}, done."
+        self.assertEdited(macro, "Hi Mary 'Jane' Ann Lee, done.")
+
+    def test_outer_placeholder_counts_joined_words_once(self):
+        self.assertFalse(check("Thanks, {{current_user.first_name}}", "Thanks, Mary-Jane O'Neil Lee").added_text)
+        self.assertTrue(check("Thanks, {{current_user.first_name}}", "Thanks, Mary-Jane O'Neil Lee Ann").added_text)
+        self.assertFalse(check("{{ticket.requester.first_name}}, thanks.", "Mary-Jane O'Neil Lee, thanks.").added_text)
+        self.assertTrue(check("{{ticket.requester.first_name}}, thanks.", "Hello Mary-Jane O'Neil Lee, thanks.").added_text)
 
     def test_with_filter_and_spaces(self):
         self.assertUnedited("Hi {{ ticket.requester.first_name | capitalize }}, done.", "Hi Sam, done.")
@@ -189,6 +209,10 @@ class EditTests(CompareBase):
     def test_insertion_at_a_placeholder_counts_beyond_its_limit_only(self):
         macro = "One two {{ticket.requester.first_name}} three four"
         self.assertEqual(self.pct(macro, "One two A B C D E three four"), 50.0)
+
+    def test_percent_counts_a_joined_name_once_at_a_placeholder(self):
+        macro = "One two {{ticket.requester.first_name}} three four"
+        self.assertEqual(self.pct(macro, "ONE two Mary-Jane O'Neil Lee Ann three four"), 50.0)
 
     def test_change_at_the_edge_counts_removed_words_only(self):
         macro = "One two three four five six seven eight nine ten"
