@@ -5,6 +5,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 from statistics import mean
+from typing import Iterable
 
 from .compare import compare, compile_macro, html_to_text
 from .zendesk import is_macro_event, parse_time
@@ -40,7 +41,7 @@ class Use:
     macro_title: str
     comment_type: str            # "public", "internal", or "" when no comment was saved
     status: str
-    similarity: float | None
+    pct_edited: float | None     # how much of the macro was edited, where 0 means intact
     combined_with: list[str] = field(default_factory=list)
     diff: list[tuple[str, list[str]]] | None = None
     added_text: bool = False     # kept intact, with the agent's own text around it
@@ -109,7 +110,7 @@ def analyze(audits: list[dict], macros: dict[str, dict], users: dict[str, dict],
         added_text = bool(comparison and comparison.added_text) and all(mid in macros for mid in ref_ids)
 
         for mid in ref_ids:
-            similarity = diff = None
+            pct_edited = diff = None
             if mid not in macros:
                 status = "unavailable"
             elif not texts[mid]:
@@ -119,11 +120,11 @@ def analyze(audits: list[dict], macros: dict[str, dict], users: dict[str, dict],
             elif comment is None:
                 # The macro put text in the reply box, but the update was saved
                 # without a comment, so the agent deleted all of it.
-                status, similarity = "edited", 0.0
+                status, pct_edited = "edited", 100.0
                 diff = [("delete", compiled[mid].display_words)]
             else:
                 result = results[mid]
-                similarity, diff = result.similarity, result.diff
+                pct_edited, diff = result.pct_edited, result.diff
                 updated_at = macros[mid].get("updated_at")
                 if result.intact:
                     status = "unedited"
@@ -140,13 +141,18 @@ def analyze(audits: list[dict], macros: dict[str, dict], users: dict[str, dict],
                 macro_title=titles[mid],
                 comment_type=comment_type,
                 status=status,
-                similarity=similarity,
+                pct_edited=pct_edited,
                 combined_with=[titles[o] for o in ref_ids if o != mid],
                 diff=diff,
                 added_text=status == "unedited" and added_text,
             ))
 
     return Result(since, until, uses, users, _overall(uses), _by_agent(uses, users), _by_macro(uses, macros))
+
+
+def _average(values: Iterable[float]) -> float | None:
+    values = list(values)
+    return round(mean(values), 1) if values else None
 
 
 def _overall(uses: list[Use]) -> dict:
@@ -179,7 +185,8 @@ def _overall(uses: list[Use]) -> dict:
         "agents_editing": len(agents_editing),
         "pct_agents_editing": pct(len(agents_editing), len(agents_using)),
         "macros_used": len({u.macro_id for u in uses}),
-        "avg_similarity_edited": round(mean(u.similarity for u in edited), 1) if edited else None,
+        "avg_pct_of_macro": _average(u.pct_edited for u in counted),
+        "avg_pct_of_macro_when_edited": _average(u.pct_edited for u in edited),
     }
 
 
@@ -216,8 +223,7 @@ def _by_macro(uses: list[Use], macros: dict[str, dict]) -> list[dict]:
             row[u.comment_type] += 1
         if u.status in COUNTED:
             row[u.status] += 1
-            if u.status == "edited":
-                row["_scores"].append(u.similarity)
+            row["_scores"].append(u.pct_edited)
         else:
             row["excluded"] += 1
     out = []
@@ -227,7 +233,8 @@ def _by_macro(uses: list[Use], macros: dict[str, dict]) -> list[dict]:
         row.update(
             compared=compared,
             pct_edited=pct(row["edited"], compared),
-            avg_similarity_edited=round(mean(scores), 1) if scores else None,
+            avg_pct_of_macro=_average(scores),
+            avg_pct_of_macro_when_edited=_average(s for s in scores if s > 0),
             # Zendesk's own count, as a check that we found every use.
             zendesk_usage_30d=macros.get(row["macro_id"], {}).get("usage_30d"),
         )

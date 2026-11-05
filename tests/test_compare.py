@@ -1,8 +1,12 @@
+import csv
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from zdaudit.analyze import analyze, macro_text
 from zdaudit.compare import compare, compile_macro
+from zdaudit.report import render_html, write_all
 from zdaudit.sample import generate
 
 GREETING = "Hi {{ticket.requester.first_name}},\n\nThanks for writing in. We fixed it."
@@ -18,13 +22,13 @@ def check(macros, sent, dynamic=None):
 class CompareBase(unittest.TestCase):
     def assertUnedited(self, macro, sent, dynamic=None):
         for result in check(macro, sent, dynamic).results:
-            self.assertTrue(result.intact, f"expected a match, got {result.similarity}%")
-            self.assertEqual(result.similarity, 100.0)
+            self.assertTrue(result.intact, f"expected a match, got {result.pct_edited}% edited")
+            self.assertEqual(result.pct_edited, 0.0)
 
     def assertEdited(self, macro, sent, dynamic=None):
         result = check(macro, sent, dynamic).results[0]
         self.assertFalse(result.intact)
-        self.assertLess(result.similarity, 100)
+        self.assertGreater(result.pct_edited, 0)
 
 
 class PlaceholderTests(CompareBase):
@@ -104,15 +108,45 @@ class EditTests(CompareBase):
     def test_added_text_does_not_lower_the_score(self):
         alone = check(GREETING, "Hi Priya,\n\nThanks for writing in. We fixed this.").results[0]
         padded = check(GREETING, "Hello!\n\nHi Priya,\n\nThanks for writing in. We fixed this.\n\nSam").results[0]
-        self.assertEqual(alone.similarity, padded.similarity)
+        self.assertEqual(alone.pct_edited, padded.pct_edited)
 
     def test_score_reflects_size_of_edit(self):
-        small = check(GREETING, "Hi Priya, Thanks for writing in. We fixed this.").results[0].similarity
-        large = check(GREETING, "Hi Priya, sorry, still looking into it.").results[0].similarity
-        self.assertGreater(small, large)
+        small = check(GREETING, "Hi Priya, Thanks for writing in. We fixed this.").results[0].pct_edited
+        large = check(GREETING, "Hi Priya, sorry, still looking into it.").results[0].pct_edited
+        self.assertLess(small, large)
 
-    def test_inserted_text_keeps_a_high_score(self):
-        self.assertEqual(check(BODY, "Thanks for writing in. Sorry! We fixed it.").results[0].similarity, 99.9)
+    def pct(self, macro, sent):
+        return check(macro, sent).results[0].pct_edited
+
+    def test_changed_word_counts_once(self):
+        self.assertEqual(self.pct("One two three four five six seven eight nine ten",
+                                  "One two three four TYPO six seven eight nine ten"), 10.0)
+
+    def test_inserted_words_count_by_how_many(self):
+        macro = "One two three four five six seven eight nine ten"
+        self.assertEqual(self.pct(macro, "One two three four five extra six seven eight nine ten"), 10.0)
+        self.assertEqual(self.pct(macro, "One two three four five extra words here six seven eight nine ten"), 30.0)
+
+    def test_long_insertion_stops_at_100(self):
+        filler = " ".join(["word"] * 50)
+        self.assertEqual(self.pct("One two three four", f"One two {filler} three four"), 100.0)
+
+    def test_replacement_counts_its_longer_side(self):
+        self.assertEqual(self.pct("One two three four five six seven eight nine ten",
+                                  "One two three X Y Z Q six seven eight nine ten"), 40.0)
+
+    def test_filled_placeholder_is_not_counted(self):
+        self.assertEqual(self.pct(GREETING, "Hi Priya, Thanks for writing in. We fixed this."), 12.5)
+
+    def test_placeholder_over_its_limit_counts_only_the_extra(self):
+        macro = "Case {{ticket.custom}} is open and waiting for a reply"
+        self.assertEqual(self.pct(macro, "Case one two three four five six seven is open and waiting for a reply"), 25.0)
+
+    def test_rewrite_is_100(self):
+        self.assertEqual(self.pct(BODY, "Completely different words sent instead."), 100.0)
+
+    def test_punctuation_only_change_is_under_1(self):
+        self.assertEqual(self.pct("Thanks for writing!", "Thanks for writing."), 0.1)
 
     def test_empty_comment(self):
         self.assertEdited(BODY, "")
@@ -247,7 +281,7 @@ class SeveralMacrosTests(CompareBase):
             results = dict(zip(macros, comparison.results))
             self.assertTrue(results[long].intact)
             self.assertFalse(results[short].intact)
-            self.assertEqual(results[short].similarity, 0)
+            self.assertEqual(results[short].pct_edited, 100.0)
             self.assertFalse(comparison.added_text)
 
     def test_placement_keeps_the_most_macros_intact(self):
@@ -259,7 +293,7 @@ class SeveralMacrosTests(CompareBase):
     def test_edited_macros_do_not_share_words(self):
         one, two = "Alpha beta gamma delta.", "Alpha beta gamma epsilon."
         comparison = check([one, two], "Alpha beta gamma zeta.")
-        self.assertEqual(sorted(r.similarity for r in comparison.results), [0.0, 75.0])
+        self.assertEqual(sorted(r.pct_edited for r in comparison.results), [25.0, 100.0])
 
 
 def use_macro(mid, text, updated="2026-01-01T00:00:00Z"):
@@ -291,7 +325,7 @@ class AnalyzeTests(unittest.TestCase):
     def test_deleted_macro_text_counts_as_edited(self):
         result = run_audit([use_macro(1, "Hi {{ticket.requester.first_name}}, done.")], [1])
         use = result.uses[0]
-        self.assertEqual((use.status, use.similarity, use.comment_type), ("edited", 0.0, ""))
+        self.assertEqual((use.status, use.pct_edited, use.comment_type), ("edited", 100.0, ""))
         self.assertEqual(use.diff, [("delete", ["Hi", "{{ticket.requester.first_name}},", "done."])])
         self.assertEqual(result.overall["by_type"]["none"]["edited"], 1)
 
@@ -299,7 +333,7 @@ class AnalyzeTests(unittest.TestCase):
         result = run_audit([use_macro(1, "First part."), use_macro(2, "Second part.")], [1, 2],
                            "First part.\n\nSecond piece.")
         one, two = result.uses
-        self.assertEqual((one.status, one.similarity, one.diff), ("unedited", 100.0, None))
+        self.assertEqual((one.status, one.pct_edited, one.diff), ("unedited", 0.0, None))
         self.assertEqual(two.status, "edited")
         # The diff shows only this macro's changes, not the other macro's text.
         self.assertEqual(two.diff, [("equal", ["Second"]), ("delete", ["part."]), ("insert", ["piece."])])
@@ -317,15 +351,54 @@ class AnalyzeTests(unittest.TestCase):
     def test_only_placeholders_is_not_counted(self):
         result = run_audit([use_macro(1, "{{ticket.id}}")], [1], "Completely unrelated reply.")
         self.assertEqual(result.uses[0].status, "only_placeholders")
-        self.assertIsNone(result.uses[0].similarity)
+        self.assertIsNone(result.uses[0].pct_edited)
         self.assertEqual(result.overall["compared"], 0)
 
     def test_macro_applied_twice_needs_one_copy(self):
         result = run_audit([use_macro(1, "First part.")], [1, 1], "First part.")
         self.assertEqual([u.status for u in result.uses], ["unedited", "unedited"])
 
+    def test_macro_averages(self):
+        until = datetime(2026, 10, 30, tzinfo=timezone.utc)
+        macro = use_macro(1, "One two three four five six seven eight nine ten")
+        audit = lambda i, body: {"id": i, "ticket_id": i, "created_at": "2026-10-20T00:00:00Z", "author_id": 7,
+                                 "events": [{"type": "MacroReference", "macro_id": 1},
+                                            {"type": "Comment", "body": body, "public": True}]}
+        audits = [audit(1, "One two three four five six seven eight nine ten"),
+                  audit(2, "One two three four TYPO six seven eight nine ten"),
+                  audit(3, "One TYPO three four OOPS six seven eight nine ten")]
+        result = analyze(audits, {"1": macro}, {}, {}, until - timedelta(days=30), until)
+        row = result.macros[0]
+        self.assertEqual((row["avg_pct_of_macro"], row["avg_pct_of_macro_when_edited"]), (10.0, 15.0))
+        self.assertEqual(result.overall["avg_pct_of_macro"], 10.0)
+
+    def test_macro_changed_since_use_is_left_out_of_averages(self):
+        result = run_audit([use_macro(1, "First part.", "2026-10-25T00:00:00Z")], [1], "Other words.")
+        self.assertEqual(result.uses[0].status, "changed")
+        self.assertIsNone(result.macros[0]["avg_pct_of_macro"])
+
     def test_macro_without_comment_text(self):
         self.assertIsNone(macro_text({"actions": [{"field": "priority", "value": "urgent"}]}))
+
+
+class ReportTests(unittest.TestCase):
+    def test_uses_link_to_their_tickets(self):
+        html = render_html(run_audit([use_macro(1, "First part.")], [1], "Other words."), "acme")
+        self.assertIn("https://acme.zendesk.com/agent/tickets/9", html)
+        self.assertIn('data-macro="1"', html)
+
+    def test_comment_text_cannot_break_out_of_the_page_data(self):
+        html = render_html(run_audit([use_macro(1, "First part.")], [1], "</script><b>hi</b>"), "acme")
+        self.assertNotIn("</script><b>", html)
+        self.assertEqual(html.count("</script>"), 2)
+
+    def test_csvs_have_the_new_columns(self):
+        with tempfile.TemporaryDirectory() as folder:
+            paths = write_all(Path(folder), run_audit([use_macro(1, "First part.")], [1], "Other words."), "acme")
+            use = next(csv.DictReader(paths["uses"].read_text(encoding="utf-8").splitlines()))
+            macro = next(csv.DictReader(paths["macros"].read_text(encoding="utf-8").splitlines()))
+        self.assertEqual(use["pct_of_macro_edited"], "100.0")
+        self.assertEqual(macro["avg_pct_of_macro_when_edited"], "100.0")
 
 
 if __name__ == "__main__":

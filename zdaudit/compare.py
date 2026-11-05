@@ -5,7 +5,8 @@ aligned against the comment's words. A word is only ever credited to one macro.
 Everything else follows from that alignment:
 
 - A macro is intact when all of its fixed text appears, in order and unbroken.
-- Its similarity score is the share of its fixed words that were found.
+- Its edit percentage is how many of its fixed words were removed or changed, or
+  had words inserted among them, as a share of its fixed words.
 - Text was added when words are left over that no macro claimed.
 
 Differences in whitespace, formatting marks (bold, links, list bullets) and
@@ -194,16 +195,53 @@ def _required_words(parts: list) -> int:
     return total
 
 
-def _fixed_words(parts: list, available: set[str]) -> list[str]:
-    """The macro's fixed words, taking the option closest to what was sent."""
-    words: list[str] = []
+def _outline(parts: list, available: set[str]) -> list:
+    """The macro as fixed words and gap sizes, taking the option closest to what was sent."""
+    outline: list = []
     for part in parts:
         if isinstance(part, _Literal):
-            words.extend(t for t in part.tokens if _is_word(t))
-        elif isinstance(part, _Choice):
-            options = [_fixed_words(option, available) for option in part.options]
-            words.extend(max(options, key=lambda o: (len(available.intersection(o)), -len(o))))
-    return words
+            outline.extend(t for t in part.tokens if _is_word(t))
+        elif isinstance(part, _Gap):
+            outline.append(part.max_words)
+        else:
+            options = [_outline(option, available) for option in part.options]
+            outline.extend(max(options, key=lambda o: (
+                sum(item in available for item in o if isinstance(item, str)),
+                -sum(isinstance(item, str) for item in o),
+            )))
+    return outline
+
+
+def _pct_edited(outline: list, sent_words: list[str]) -> tuple[float, list[tuple[int, int]]]:
+    """How much of a macro was edited, and which runs of sent words matched it (start, length).
+
+    A replaced stretch counts as its longer side. Words inserted where a
+    placeholder sits only count beyond what the placeholder can fill. Words
+    before the macro's first match or after its last are text added around it,
+    so they don't count.
+    """
+    words: list[str] = []
+    free: dict[int, int] = {}   # position in words -> how many words a gap there can fill
+    for item in outline:
+        if isinstance(item, str):
+            words.append(item)
+        else:
+            free[len(words)] = free.get(len(words), 0) + item
+    if not words:
+        return 100.0, []
+    matcher = SequenceMatcher(None, words, sent_words, autojunk=False)
+    changed = 0
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        if i1 == 0 or i2 == len(words):
+            changed += i2 - i1
+        else:
+            allowed = sum(free.get(i, 0) for i in range(i1, i2 + 1))
+            changed += max(i2 - i1, j2 - j1 - allowed)
+    # An edited macro never reads 0%, even if only its punctuation changed.
+    pct = min(max(round(100 * changed / len(words), 1), 0.1), 100.0)
+    return pct, [(block.b, block.size) for block in matcher.get_matching_blocks() if block.size]
 
 
 # ---- Reading a macro's text ----------------------------------------------------
@@ -354,7 +392,7 @@ def is_placeholder(word: str) -> bool:
 @dataclass
 class MacroResult:
     intact: bool
-    similarity: float  # 0 to 100, the share of the macro's fixed words found in the comment
+    pct_edited: float  # 0 to 100, how much of the macro was edited, where 0 means intact
     diff: list[tuple[str, list[str]]] | None = None
 
 
@@ -430,24 +468,19 @@ def compare(macros: list[Macro], sent: str) -> Comparison:
     remaining = comment.without(list(placed.values()))
 
     results: list[MacroResult | None] = [
-        MacroResult(True, 100.0) if index in placed else None for index in range(len(macros))
+        MacroResult(True, 0.0) if index in placed else None for index in range(len(macros))
     ]
-    # Score edited macros largest first, so a word only counts toward one of them.
+    # Measure edited macros largest first, so a word only counts toward one of them.
     edited = [index for index, result in enumerate(results) if result is None]
     available = {comment.tokens[i] for i in range(len(claimed)) if not claimed[i]}
-    fixed = {index: _fixed_words(macros[index].core, available) for index in edited}
-    for index in sorted(edited, key=lambda i: -len(fixed[i])):
+    outlines = {index: _outline(macros[index].core, available) for index in edited}
+    for index in sorted(edited, key=lambda i: -sum(isinstance(item, str) for item in outlines[i])):
         open_words = [i for i in range(len(claimed)) if comment.is_word[i] and not claimed[i]]
-        matcher = SequenceMatcher(None, fixed[index], [comment.tokens[i] for i in open_words], autojunk=False)
-        kept = 0
-        for block in matcher.get_matching_blocks():
-            kept += block.size
-            for i in open_words[block.b:block.b + block.size]:
+        pct, matches = _pct_edited(outlines[index], [comment.tokens[i] for i in open_words])
+        for start, size in matches:
+            for i in open_words[start:start + size]:
                 claimed[i] = True
-        share = kept / len(fixed[index]) if fixed[index] else 0.0
-        results[index] = MacroResult(
-            False, min(round(share * 100, 1), 99.9), word_diff(macros[index].display_words, remaining),
-        )
+        results[index] = MacroResult(False, pct, word_diff(macros[index].display_words, remaining))
 
     added = any(comment.is_word[i] and not claimed[i] for i in range(len(claimed)))
     return Comparison(results, added)

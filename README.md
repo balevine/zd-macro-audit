@@ -5,7 +5,7 @@ This tool shows how often agents change a macro's text before they send it.
 It looks at the last 30 days of ticket updates in your Zendesk account. Every time an agent applied a macro, it compares the comment they saved with the text the macro inserts. Then it writes:
 
 - **report.html**, a readable report you can open in any browser or share
-- **macro_uses.csv**, one row per macro use (who, which macro, public or internal, edited or not, similarity score)
+- **macro_uses.csv**, one row per macro use (who, which macro, public or internal, edited or not, percent of the macro edited)
 - **macros.csv**, totals per macro
 - **agents.csv**, totals per agent
 
@@ -15,7 +15,8 @@ The report covers:
 - the share of agents who edit macros
 - which macros are edited most often, and which are usually kept intact
 - public replies and internal notes, counted separately
-- every single use, with a view of exactly what the agent changed
+- how much of each macro gets edited, on average and per use
+- every single use, with a view of exactly what the agent changed and a link to the ticket
 
 Here's the top of a report made from the tool's sample data. Below this part, the full report goes on to list agents, every single use with its changes, and the uses that couldn't be compared. In the report, hover over any underlined label to see what it means.
 
@@ -159,8 +160,26 @@ Zendesk doesn't record what it filled in, so the tool limits how many words each
 
 The limits lean toward flagging. A value longer than its limit counts as an edit even if the agent didn't touch it, because that's better than missing text an agent added. Added text that fits within a limit can still pass as part of the placeholder. To change a limit, edit `GAP_LIMITS` in `zdaudit/compare.py`.
 
-Every other change inside the macro's text counts as an edit, however small, including text added in the middle of it. Each use also gets a **similarity score**, which shows how much of the macro's wording the agent kept. 100% means it was kept intact. A fixed typo scores in the high 90s, and a full rewrite scores much lower. Text added around the macro doesn't lower the score.
-If a macro adds text but the agent saved the update with no comment, they deleted all of the macro's text. That counts as edited, with 0% similarity. The report lists these uses as "No comment".
+Every other change inside the macro's text counts as an edit, however small, including text added in the middle of it. 
+
+### How much of a macro was edited
+
+Each use gets a **percent of the macro edited**, from 0% (intact) to 100%. It counts the macro's words that were removed or changed, plus words inserted inside the macro, as a share of the macro's words.
+
+| What the agent did to a 20-word macro | Percent edited |
+| --- | --- |
+| Nothing, or added a greeting or signature around it | 0% |
+| Changed one word | 5% |
+| Inserted 3 words in the middle | 15% |
+| Replaced 2 words with 6 words | 30% |
+| Inserted 50 words in the middle | 100% |
+| Deleted all of it | 100% |
+
+A changed word counts once. Words a placeholder can fill and text added around the macro don't count, and a placeholder value over its limit only counts for the extra words. The percentage stops at 100%, so an insertion longer than the macro reads the same as a full rewrite.
+
+In the report, click a macro to see each of its uses, with this percentage and a link to the ticket. The macro table shows two averages. **Avg % of macro edited** covers all compared uses, with intact ones as 0%, so it shows the overall drift. **Avg when edited** covers only edited uses, so it shows how big the edits are when they happen.
+
+If a macro adds text but the agent saved the update with no comment, they deleted all of the macro's text. That counts as edited, with 100% of the macro edited. The report lists these uses as "No comment".
 
 If an agent applied several macros in one update, each one is judged on its own, and their text can appear in any order. Each macro counts as one use. A word in the comment can only be credited to one macro, so two macros that share a sentence need that sentence to appear twice to both count as kept intact. When only one copy appears, the macro left without it counts as edited.
 
@@ -186,7 +205,7 @@ Some uses can't be judged, so they're left out of the percentages and listed sep
 | --- | --- |
 | `zd_macro_audit.py` | The command you run. |
 | `zdaudit/zendesk.py` | OAuth and API token sign-in, and the Zendesk API calls. |
-| `zdaudit/compare.py` | Works out which words of a comment came from which macro, and scores similarity. |
+| `zdaudit/compare.py` | Works out which words of a comment came from which macro, and measures how much of it was edited. |
 | `zdaudit/analyze.py` | Turns raw data into per-use results and totals. |
 | `zdaudit/report.py` | Writes the HTML report and CSV files. |
 | `zdaudit/sample.py` | The made-up data behind `--sample`. |
