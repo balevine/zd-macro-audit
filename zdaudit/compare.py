@@ -40,6 +40,9 @@ UNKNOWN_DC_GAP = 100   # dynamic content we couldn't read could be any length
 LOOP_GAP = 30          # {% for %} repeats its contents an unknown number of times
 MAX_DC_DEPTH = 3       # dynamic content can include other dynamic content
 MAX_PLACEMENTS = 50    # places to consider for one macro in one comment, to bound the search
+# The exact placement search doubles in time with each macro in one update. Updates
+# normally apply 1 to 3, so past this many a greedy placement is used instead.
+MAX_EXACT_MACROS = 8
 
 _TAG = re.compile(r"\{\{.*?\}\}|\{%.*?%\}", re.S)
 _TAG_NAME = re.compile(r"\{%-?\s*(\w+)")
@@ -422,13 +425,35 @@ def _extend(comment: _Comment, claimed: list[bool], start: int, end: int, macro:
     return start, end
 
 
+def _place_greedy(candidates: list[list[tuple[int, int]]]) -> dict[int, tuple[int, int]]:
+    """Place the longest ranges first, then the earliest, each macro once, with no word shared.
+
+    Length is in tokens, as the exact search counts text. Fast but not always
+    best: a long range can block two shorter macros that would both have fit.
+    Macros with the same range go in the order they were applied.
+    """
+    claimed: set[int] = set()
+    placed: dict[int, tuple[int, int]] = {}
+    ranges = [(start, end, index) for index, found in enumerate(candidates) for start, end in found]
+    for start, end, index in sorted(ranges, key=lambda r: (r[0] - r[1], r[0], r[2])):
+        if index in placed or claimed.intersection(range(start, end)):
+            continue
+        placed[index] = (start, end)
+        claimed.update(range(start, end))
+    # In text order, as the exact search gives them.
+    return dict(sorted(placed.items(), key=lambda item: item[1]))
+
+
 def _place(candidates: list[list[tuple[int, int]]]) -> dict[int, tuple[int, int]]:
     """Give each macro its own range of the comment, with no word shared.
 
-    Tries every arrangement. It keeps the most macros intact, then accounts for
-    the most text, then takes the earliest text, so the result doesn't depend on
-    the order macros were applied. Only macros with identical text can still tie.
+    Up to MAX_EXACT_MACROS it tries every arrangement. It keeps the most macros
+    intact, then accounts for the most text, then takes the earliest text, so the
+    result doesn't depend on the order macros were applied. Only macros with
+    identical text can still tie. Past that it places greedily.
     """
+    if len(candidates) > MAX_EXACT_MACROS:
+        return _place_greedy(candidates)
     memo: dict[tuple[int, int], tuple[int, int, tuple]] = {}
 
     def rank(option: tuple[int, int, tuple]) -> tuple:

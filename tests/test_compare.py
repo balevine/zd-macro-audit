@@ -2,7 +2,7 @@ import time
 import unittest
 
 from zdaudit.analyze import macro_text
-from zdaudit.compare import compare, compile_macro, html_to_text, is_placeholder
+from zdaudit.compare import MAX_EXACT_MACROS, _place, compare, compile_macro, html_to_text, is_placeholder
 
 GREETING = "Hi {{ticket.requester.first_name}},\n\nThanks for writing in. We fixed it."
 BODY = "Thanks for writing in. We fixed it."
@@ -477,6 +477,57 @@ class PlacementTests(CompareBase):
 
     def test_macro_must_appear_more_than_the_first_time_it_could(self):
         self.assertUnedited("Hi {{ticket.custom}} bye", "Hi and more. Hi a bye")
+
+
+class ManyMacrosTests(unittest.TestCase):
+    """Past MAX_EXACT_MACROS in one update, macros are placed greedily instead of exactly."""
+
+    # A long middle range that blocks a range on each side of it, and one-token ranges before them all.
+    MIDDLE, LEFT, RIGHT = [(12, 16)], [(10, 13)], [(15, 18)]
+
+    def fillers(self, count):
+        return [[(2 * i, 2 * i + 1)] for i in range(count)]
+
+    def test_at_the_cap_the_exact_search_still_runs(self):
+        candidates = [self.MIDDLE, self.LEFT, self.RIGHT, *self.fillers(MAX_EXACT_MACROS - 3)]
+        expected = {1: (10, 13), 2: (15, 18), **{3 + i: (2 * i, 2 * i + 1) for i in range(MAX_EXACT_MACROS - 3)}}
+        self.assertEqual(_place(candidates), expected)
+
+    def test_greedy_takes_the_longest_then_the_earliest_and_shares_no_words(self):
+        candidates = [
+            self.MIDDLE,                # 4 tokens, the longest, so placed first
+            self.LEFT,                  # overlaps the middle, so not placed
+            self.RIGHT,                 # overlaps the middle, so not placed
+            [(20, 23)],                 # same length as the next and earlier, so it wins
+            [(21, 24)],                 # overlaps the one before, so not placed
+            [(30, 32), (33, 35)],       # takes its earlier range only
+            [(34, 36)],                 # free because the macro before only took one range
+        ]
+        candidates += self.fillers(MAX_EXACT_MACROS + 1 - len(candidates))
+        self.assertEqual(len(candidates), MAX_EXACT_MACROS + 1)
+        # In text order, as the exact search gives them, though the fillers were placed last.
+        self.assertEqual(list(_place(candidates).items()), [
+            (7, (0, 1)), (8, (2, 3)), (0, (12, 16)), (3, (20, 23)), (5, (30, 32)), (6, (34, 36)),
+        ])
+
+    def test_whole_comparison_switches_to_greedy_past_the_cap(self):
+        left, right, middle = "A B C.", "F G H.", "C. D E F"
+        fillers = [f"Filler {i}." for i in range(MAX_EXACT_MACROS - 2)]
+        sent = "A B C. D E F G H. " + " ".join(fillers)
+        at_cap = check([middle, left, right, *fillers[:-1]], sent)
+        past_cap = check([middle, left, right, *fillers], sent)
+        self.assertEqual([r.intact for r in at_cap.results], [False, True, True] + [True] * (MAX_EXACT_MACROS - 3))
+        self.assertEqual([r.intact for r in past_cap.results], [True, False, False] + [True] * (MAX_EXACT_MACROS - 2))
+        self.assertTrue(at_cap.added_text)  # the last filler belongs to no macro
+        self.assertEqual([r.pct_of_macro for r in past_cap.results[:3]], [0.0, 33.3, 33.3])
+
+    def test_many_short_overlapping_macros_finish_quickly(self):
+        # Each "w w" could sit at any of 24 places, which the exact search would take seconds over.
+        started = time.perf_counter()
+        comparison = check(["w w"] * 12, "w " * 25)
+        self.assertLess(time.perf_counter() - started, 0.5)
+        self.assertEqual([r.intact for r in comparison.results], [True] * 12)
+        self.assertTrue(comparison.added_text)  # 24 of the 25 words are placed
 
 
 class IsPlaceholderTests(unittest.TestCase):
