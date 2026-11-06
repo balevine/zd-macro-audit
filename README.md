@@ -2,7 +2,7 @@
 
 This tool shows how often agents change a macro's text before they send it.
 
-It looks at the last 30 days of ticket updates in your Zendesk account. Every time an agent applied a macro, it compares the comment they saved with the text the macro inserts. Then it writes:
+It looks at the last 30 days of ticket updates in your Zendesk account, up to the moment the run starts. Anything saved after that waits for the next run. Every time an agent applied a macro, it compares the comment they saved with the text the macro inserts. Then it writes:
 
 - **report.html**, a readable report you can open in any browser or share
 - **macro_uses.csv**, one row per macro use (who, which macro, public or internal, edited or not, percent of the macro edited)
@@ -16,7 +16,7 @@ The report covers:
 - which macros are edited most often, and which are usually kept intact
 - public replies and internal notes, counted separately
 - how much of each macro gets edited, on average and per use
-- every single use, with a view of exactly what the agent changed and a link to the ticket
+- every single use, with a view of exactly what the agent changed and a link to the ticket. Long stretches of added or removed text are shortened to "… N more words".
 
 Here's the top of a report made from the tool's sample data. Below this part, the full report goes on to list agents, every single use with its changes, and the uses that couldn't be compared. In the report, hover over any underlined label to see what it means.
 
@@ -65,7 +65,7 @@ You'll paste the unique identifier and the secret into the tool the first time y
 python3 zd_macro_audit.py
 ```
 
-The first time, it asks for your Zendesk subdomain. For `acme.zendesk.com`, that's `acme`. Then it asks how you want to sign in. Choose OAuth, and it asks for two more things.
+The first time, it asks for your Zendesk subdomain. For `acme.zendesk.com`, that's `acme`. Pasting `acme.zendesk.com` or a Zendesk link works too. If what's left isn't just letters, numbers and hyphens, the tool stops and says so. Then it asks how you want to sign in. Choose OAuth, and it asks for two more things.
 
 1. The unique identifier from step 5.
 2. The secret from step 7. Nothing shows on screen while you paste or type it, so it stays private. Paste it and press Enter.
@@ -113,6 +113,16 @@ The tool reads the history of every ticket updated in the period, one request pe
 | 10,000 | about 50 minutes | about 15 minutes |
 
 The tool prints its progress and an estimate of the time left. If Zendesk says the tool is going too fast, it waits and tries again on its own. Other tools that use your Zendesk API share the same limit, so a run during quiet hours goes faster.
+
+### When Zendesk stops answering
+
+If a request fails because of a network error, or because Zendesk is busy or has a server error, the tool waits and tries again, several times. A ticket that still fails is set aside and tried once more at the end of the run. Any ticket still unread after that is listed in the terminal summary, in a warning at the top of the report, and in `unread_tickets.csv` (ticket ID and link). Running again usually picks them up.
+
+If 20 tickets in a row fail, Zendesk has probably stopped answering, so the run stops early. It still writes a report from the tickets it read, marked incomplete at the top. If no tickets could be read, or the macros' text couldn't be fetched, there's no report.
+
+Tickets that were deleted, or that the sign-in isn't allowed to see (for example, restricted to a group), are skipped. The summary and the report count them in a note. This can explain why the report finds fewer uses than the "Zendesk count" column.
+
+For scripts, the tool exits with 0 when the run finished, even if a few tickets were left unread. It exits with 1 when the run stopped early, when there's no report, or when it stopped with an error, such as a missing or invalid setting or a sign-in Zendesk didn't accept.
 
 ## Zendesk endpoints used
 
@@ -199,8 +209,9 @@ Some uses can't be judged, so they're left out of the percentages and listed sep
 
 - The tool only reads from Zendesk. It never changes anything in your account.
 - With OAuth, the tool asks Zendesk for **read** access only. Your sign-in is saved in `.tokens/` in this folder, readable only by your user account. Delete that folder to sign out. To cut off access completely, delete the OAuth client in Admin Center.
-- An API token can't be limited to reading. It has the same access as the admin who owns it, so treat `config.json` like a password. The file is readable only by your user account. To cut off access, delete the token in Admin Center.
-- The report and CSVs contain agent names and parts of ticket comments. Share them the way you'd share any internal support data.
+- An API token can't be limited to reading. It has the full rights of the admin who owns it, so anyone holding it can read and change everything that admin can. The tool itself only reads. Where you can, use OAuth instead, since it only gets read access. Treat `config.json` like a password. The file is readable only by your user account. To cut off access, delete the token in Admin Center.
+- The report contains text from ticket comments, both public replies to customers and internal notes, which can include customer details. The report and CSVs contain agent names and emails. Treat them as sensitive, and check before you forward them or upload them anywhere.
+- Don't share, copy or upload `config.json` or `.tokens/`. They hold your secret, token and sign-in.
 
 ## Files
 
