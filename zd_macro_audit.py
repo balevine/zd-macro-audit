@@ -130,7 +130,8 @@ def print_summary(result: analyze.Result, paths: dict[str, Path]) -> None:
             print(f"\nNote: {len(cov.skipped):,} tickets were skipped because they were deleted or this sign-in "
                   "can't see them.")
     if cov.names_missing:
-        print("\nWarning: Zendesk didn't answer when asked for agent names, so agents are shown by ID.")
+        print("\nWarning: Zendesk stopped answering while the tool was fetching agent names, so agents without "
+              "a name are shown by ID.")
     print(f"\nReport: {paths['report']}")
     print(f"CSVs:   {paths['uses'].parent}")
 

@@ -281,8 +281,8 @@ class RunTests(TempFolderTest):
         self.signed_in(self.fetched([], names_missing=True))
         code, out, _ = self.run_main()
         self.assertEqual(code, 0)
-        self.assertIn("\nWarning: Zendesk didn't answer when asked for agent names, so agents are shown by ID.\n"
-                      "\nReport: ", out)
+        self.assertIn("\nWarning: Zendesk stopped answering while the tool was fetching agent names, so agents "
+                      "without a name are shown by ID.\n\nReport: ", out)
         self.assertNotIn("Unread", out)
         self.assertFalse((self.report_folder() / "unread_tickets.csv").exists())
 
@@ -305,7 +305,7 @@ class RunTests(TempFolderTest):
         _, out, _ = self.run_main()
         self.assertIn(f"  All listed in {self.report_folder() / 'unread_tickets.csv'}\n"
                       "\nNote: 2 tickets were skipped because they were deleted or this sign-in can't see them.\n"
-                      "\nWarning: Zendesk didn't answer when asked for agent names", out)
+                      "\nWarning: Zendesk stopped answering while the tool was fetching agent names", out)
 
     def test_no_note_when_nothing_was_skipped(self):
         self.signed_in(self.fetched([5]))
@@ -349,9 +349,10 @@ class RunTests(TempFolderTest):
         code, out, _ = self.run_main()
         self.assertEqual(code, 0)
         html = (self.report_folder() / "report.html").read_text(encoding="utf-8")
-        self.assertIn("Agent names are missing.", html)
+        self.assertIn("Not every agent name could be fetched.", html)
         self.assertIn("<td>User 7<div class='sub'></div></td>", html)
-        self.assertIn("Warning: Zendesk didn't answer when asked for agent names", out)
+        self.assertIn("Warning: Zendesk stopped answering while the tool was fetching agent names, so agents "
+                      "without a name are shown by ID.", out)
 
     def test_deleted_ticket_is_noted_from_sign_in_to_report(self):
         self.fake_account({})  # ticket 3 answers 404

@@ -328,8 +328,9 @@ def _warnings(result: Result, subdomain: str | None) -> str:
         boxes.append(f'<div class="warning" role="note">{text} The unread {noun} {verb} listed below and in '
                      f'<code>unread_tickets.csv</code>.<div class="ids">{links}</div></div>')
     if cov.names_missing:
-        boxes.append('<div class="warning" role="note"><strong>Agent names are missing.</strong> Zendesk didn\'t '
-                     "answer when the tool asked for them, so agents are shown by ID.</div>")
+        boxes.append('<div class="warning" role="note"><strong>Not every agent name could be fetched.</strong> '
+                     "Zendesk stopped answering while the tool was fetching them, so agents without a name are "
+                     "shown by ID.</div>")
     if cov.skipped:
         # Not a failure, so a plain note rather than a warning.
         one = len(cov.skipped) == 1

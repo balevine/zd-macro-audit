@@ -67,7 +67,7 @@ class Coverage:
     tickets: int = 0                                  # tickets updated in the period
     unread: list[int] = field(default_factory=list)   # tickets Zendesk kept failing on, or never reached
     stopped_early: bool = False                       # Zendesk stopped answering, so the run gave up
-    names_missing: bool = False                       # agent names couldn't be fetched
+    names_missing: bool = False                       # some or all agent names couldn't be fetched
     skipped: list[int] = field(default_factory=list)  # tickets deleted or hidden from this sign-in (403 or 404)
 
     @property
@@ -573,14 +573,24 @@ def fetch_dynamic_content(zd: Zendesk, log: Callable[[str], None]) -> dict[str, 
     return items
 
 
-def fetch_users(zd: Zendesk, ids: Iterable[str]) -> dict[str, dict]:
+def fetch_users(zd: Zendesk, ids: Iterable[str]) -> tuple[dict[str, dict], bool]:
+    """The users found, and whether every batch was read.
+
+    Stops at the first batch Zendesk gives up on: each one already took minutes of retries.
+    """
     ids = sorted({str(i) for i in ids if i})
     users: dict[str, dict] = {}
     for start in range(0, len(ids), 100):
         chunk = ",".join(ids[start:start + 100])
-        for user in zd.get(f"/api/v2/users/show_many.json?ids={chunk}").get("users", []):
+        try:
+            page = zd.get(f"/api/v2/users/show_many.json?ids={chunk}")
+        except ZendeskError as exc:
+            if not exc.gave_up:
+                raise
+            return users, False
+        for user in page.get("users", []):
             users[str(user["id"])] = user
-    return users
+    return users, True
 
 
 def fetch_all(zd: Zendesk, since: datetime, log: Callable[[str], None] = print, workers: int = 4) -> dict:
@@ -607,11 +617,8 @@ def fetch_all(zd: Zendesk, since: datetime, log: Callable[[str], None] = print, 
         log("Fetching dynamic content used in macros...")
         dynamic = fetch_dynamic_content(zd, log)
     log("Fetching agent names...")
-    try:
-        users = fetch_users(zd, (a["author_id"] for a in audits))
-    except ZendeskError as exc:
-        if not exc.gave_up:
-            raise
-        log("  Zendesk didn't answer, so agents are shown by ID instead of by name.")
-        users, coverage.names_missing = {}, True
+    users, complete = fetch_users(zd, (a["author_id"] for a in audits))
+    if not complete:
+        log("  Zendesk stopped answering, so agents without a name are shown by ID.")
+        coverage.names_missing = True
     return {"audits": audits, "macros": macros, "users": users, "dynamic": dynamic, "coverage": coverage}

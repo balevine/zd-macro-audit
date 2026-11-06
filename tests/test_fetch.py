@@ -6,6 +6,7 @@ from unittest import mock
 
 from zdaudit import zendesk
 from zdaudit.analyze import analyze
+from zdaudit.report import render_html
 
 NOW = datetime.now(timezone.utc)
 SINCE = NOW - timedelta(days=30)
@@ -381,7 +382,7 @@ class AfterTheTicketsTests(unittest.TestCase):
         data = self.run_fetch({"/api/v2/users/show_many.json?ids=7": gave_up()})
         self.assertEqual(data["users"], {})
         self.assertTrue(data["coverage"].names_missing)
-        self.assertIn("  Zendesk didn't answer, so agents are shown by ID instead of by name.", self.messages)
+        self.assertIn("  Zendesk stopped answering, so agents without a name are shown by ID.", self.messages)
         self.assertEqual(sorted(a["id"] for a in data["audits"]), [11, 13, 20])
         result = analyze(**data, since=SINCE, until=NOW)
         self.assertEqual([a["name"] for a in result.agents], ["User 7"])
@@ -522,8 +523,76 @@ class FetchUsersTests(unittest.TestCase):
         pages = {f"/api/v2/users/show_many.json?ids={','.join(by_order[:100])}": {"users": [{"id": 1}]},
                  f"/api/v2/users/show_many.json?ids={by_order[100]}": {"users": [{"id": 2}]}}
         fake = FakeZendesk(pages)
-        self.assertEqual(set(zendesk.fetch_users(fake, ids + ["1", None])), {"1", "2"})
+        users, complete = zendesk.fetch_users(fake, ids + ["1", None])
+        self.assertEqual((set(users), complete), ({"1", "2"}, True))
         self.assertEqual(len(fake.calls), 2)
+
+    def test_keeps_the_users_found_before_zendesk_gives_up(self):
+        # 250 IDs from 1001 to 1250, so sorting them as text keeps them in number order.
+        batches = [",".join(str(i) for i in range(start, min(start + 100, 1251))) for start in (1001, 1101, 1201)]
+        urls = [f"/api/v2/users/show_many.json?ids={b}" for b in batches]
+        fake = FakeZendesk({urls[0]: {"users": [{"id": 1001, "name": "Ana"}, {"id": 1100, "name": "Bo"}]},
+                            urls[2]: {"users": [{"id": 1201, "name": "Cy"}]}},
+                           {urls[1]: gave_up()})
+        users, complete = zendesk.fetch_users(fake, [str(i) for i in range(1250, 1000, -1)])
+        self.assertEqual(users, {"1001": {"id": 1001, "name": "Ana"}, "1100": {"id": 1100, "name": "Bo"}})
+        self.assertFalse(complete)
+        self.assertEqual(fake.calls, urls[:2], "stops at the batch Zendesk gave up on")
+
+    def test_other_errors_still_raise(self):
+        fake = FakeZendesk({}, {"/api/v2/users/show_many.json?ids=1": 400})
+        with self.assertRaisesRegex(zendesk.ZendeskError, "fake error"):
+            zendesk.fetch_users(fake, ["1"])
+
+
+class PartialNamesTests(unittest.TestCase):
+    """150 agents each used a macro on ticket 1. Zendesk answers for the first 100 names only."""
+    FIRST = "/api/v2/users/show_many.json?ids=" + ",".join(str(i) for i in range(1001, 1101))
+    SECOND = "/api/v2/users/show_many.json?ids=" + ",".join(str(i) for i in range(1101, 1151))
+
+    def run_fetch(self, errors):
+        start = f"/api/v2/incremental/tickets/cursor?start_time={int(SINCE.timestamp())}"
+        audits = [{**audit(i, 1, 2, "MacroReference"), "author_id": i} for i in range(1001, 1151)]
+        macro = {"id": 55, "title": "Done",
+                 "actions": [{"field": "comment_value", "value": "Hi {{ticket.requester.first_name}}, done."}]}
+        pages = {
+            start: {"tickets": [{"id": 1}], "end_of_stream": True},
+            audits_path(1): {"audits": audits, "meta": {"has_more": False}},
+            MACRO_PATH + "&include=usage_30d": {"macros": [macro], "meta": {"has_more": False}},
+            self.FIRST: {"users": [{"id": 1001, "name": "Ana", "email": "ana@example.com"}]},
+            self.SECOND: {"users": [{"id": 1101, "name": "Bo", "email": "bo@example.com"}]},
+        }
+        self.messages = []
+        self.fake = FakeZendesk(pages, errors)
+        return zendesk.fetch_all(self.fake, SINCE, log=self.messages.append, workers=2)
+
+    def test_names_found_before_zendesk_gave_up_are_kept(self):
+        data = self.run_fetch({self.SECOND: gave_up()})
+        self.assertEqual(data["users"], {"1001": {"id": 1001, "name": "Ana", "email": "ana@example.com"}})
+        self.assertTrue(data["coverage"].names_missing)
+        self.assertEqual(self.messages[-2:], ["Fetching agent names...",
+                                              "  Zendesk stopped answering, so agents without a name are shown by ID."])
+
+        result = analyze(**data, since=SINCE, until=NOW)
+        names = {a["agent_id"]: a["name"] for a in result.agents}
+        self.assertEqual((names["1001"], names["1101"], names["1150"]), ("Ana", "User 1101", "User 1150"))
+        html = render_html(result, "acme")
+        self.assertIn('<div class="warning" role="note"><strong>Not every agent name could be fetched.</strong> '
+                      "Zendesk stopped answering while the tool was fetching them, so agents without a name are "
+                      "shown by ID.</div>", html)
+        self.assertIn("<td>Ana<div class='sub'>ana@example.com</div></td>", html)
+        self.assertIn("<td>User 1101<div class='sub'></div></td>", html)
+        self.assertNotIn("<td>Bo<", html)
+        self.assertIn('"agent": "Ana"', html)
+        self.assertIn('"agent": "User 1101"', html)
+
+    def test_every_batch_answered_means_nothing_missing(self):
+        data = self.run_fetch({})
+        self.assertEqual(set(data["users"]), {"1001", "1101"})
+        self.assertFalse(data["coverage"].names_missing)
+        self.assertEqual([c for c in self.fake.calls if "users" in c], [self.FIRST, self.SECOND])
+        html = render_html(analyze(**data, since=SINCE, until=NOW), "acme")
+        self.assertNotIn("Not every agent name", html)
 
 
 if __name__ == "__main__":

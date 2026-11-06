@@ -290,7 +290,7 @@ class SkippedNoteTests(unittest.TestCase):
     def test_comes_after_the_warnings(self):
         html = self.render([4], unread=[5], names_missing=True)
         self.assertEqual(html.count('class="notice"'), 1)
-        self.assertLess(html.index("Agent names are missing"), html.index("1 ticket was skipped"))
+        self.assertLess(html.index("Not every agent name could be fetched"), html.index("1 ticket was skipped"))
         self.assertLess(html.index("1 ticket was skipped"), html.index('class="tiles"'))
 
     def test_nothing_when_none_were_skipped(self):
@@ -342,21 +342,22 @@ class UnreadWarningTests(unittest.TestCase):
 
     def test_names_missing(self):
         html = self.render([], names_missing=True)
-        self.assertIn('<div class="warning" role="note"><strong>Agent names are missing.</strong> Zendesk didn\'t '
-                      "answer when the tool asked for them, so agents are shown by ID.</div>", html)
+        self.assertIn('<div class="warning" role="note"><strong>Not every agent name could be fetched.</strong> '
+                      "Zendesk stopped answering while the tool was fetching them, so agents without a name are "
+                      "shown by ID.</div>", html)
         self.assertEqual(html.count('class="warning"'), 1)
 
     def test_both_boxes(self):
         html = self.render([5], tickets=10, names_missing=True)
         self.assertEqual(html.count('class="warning"'), 2)
-        self.assertLess(html.index("couldn't be read"), html.index("Agent names are missing"))
+        self.assertLess(html.index("couldn't be read"), html.index("Not every agent name could be fetched"))
 
     def test_no_links_without_a_subdomain(self):
         self.assertIn('<div class="ids">5, 6</div>', self.render([5, 6], subdomain=None))
 
     def test_comes_before_the_summary_tiles(self):
         html = self.render([5], names_missing=True)
-        self.assertLess(html.index("Agent names are missing"), html.index('class="tiles"'))
+        self.assertLess(html.index("Not every agent name could be fetched"), html.index('class="tiles"'))
 
     def test_text_is_escaped(self):
         self.assertIn('<div class="ids">1&lt;b&gt;</div>', self.render(["1<b>"], subdomain=None))
