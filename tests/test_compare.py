@@ -44,7 +44,10 @@ class PlaceholderTests(CompareBase):
             ("{{ticket.requester.first_name}}", 3), ("{{ticket.requester.last_name}}", 3),
             ("{{ticket.requester.name}}", 6),
             ("{{ticket.id}}", 3), ("{{id}}", 3),
-            ("{{ticket.status}}", 5), ("{{ticket.ticket_field_123}}", 5), ("{{ticket.valid}}", 5),
+            ("{{ticket.ticket_field_123}}", 15), ("{{ ticket.ticket_field_123 | upcase }}", 15),
+            ("{{ticket.ticket_field_option_title_123}}", 15),
+            ("{{ticket.ticket_field_123_extra}}", 5), ("{{ticket.my_ticket_field_123}}", 5),
+            ("{{ticket.status}}", 5), ("{{ticket.valid}}", 5),
             ("{{dc.unknown}}", 100),
             ("{% for c in ticket.comments %}{{c.value}}{% endfor %}", 30),
         ):
@@ -196,6 +199,13 @@ class EditTests(CompareBase):
     def test_placeholder_over_its_limit_counts_only_the_extra(self):
         macro = "Case {{ticket.custom}} is open and waiting for a reply"
         self.assertEqual(self.pct(macro, "Case one two three four five six seven is open and waiting for a reply"), 25.0)
+
+    def test_custom_field_fills_up_to_15_words(self):
+        macro = "Case {{ticket.ticket_field_123}} is open and waiting for a reply"
+        within = check(macro, f"Case {'w ' * 15}is open and waiting for a reply").results[0]
+        over = check(macro, f"Case {'w ' * 16}is open and waiting for a reply").results[0]
+        self.assertEqual((within.intact, within.pct_of_macro), (True, 0.0))
+        self.assertEqual((over.intact, over.pct_of_macro), (False, 12.5))
 
     def test_rewrite_is_100(self):
         self.assertEqual(self.pct(BODY, "Completely different words sent instead."), 100.0)

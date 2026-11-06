@@ -28,6 +28,7 @@ GAP_LIMITS = (
     (re.compile(r"comment|description"), 200),
     (re.compile(r"signature"), 40),
     (re.compile(r"url|link|title|subject"), 15),
+    (re.compile(r"(?:^|\.)ticket_field_\d+$"), 15),   # custom fields are often free text
     (re.compile(r"email"), 8),
     (re.compile(r"phone"), 6),
     (re.compile(r"first_name|last_name"), 3),

@@ -149,12 +149,13 @@ Zendesk doesn't record what it filled in, so the tool limits how many words each
 | `comment`, `description` | 200 |
 | `signature` | 40 |
 | `url`, `link`, `title`, `subject` | 15 |
+| A custom field, `ticket.ticket_field_<id>` | 15 |
 | `email` | 8 |
 | `phone` | 6 |
 | `first_name`, `last_name` | 3 |
 | `name` | 6 |
 | Ends in `id` | 3 |
-| Anything else, including custom fields | 5 |
+| Anything else | 5 |
 | A `{% for %}` loop | 30 |
 | `{{dc.*}}` that couldn't be read | 100 |
 
