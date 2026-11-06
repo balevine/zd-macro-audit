@@ -7,6 +7,7 @@ from datetime import timedelta
 from pathlib import Path
 
 from tests.helpers import UNTIL, fields_only_macro, make_audit, run_audit, run_audits, use_macro
+from zdaudit.zendesk import Coverage
 from zdaudit.report import _bar, _fmt_macro_pct, _render_diff, fmt_pct, render_html, ticket_url, write_all
 
 
@@ -219,6 +220,96 @@ class PageTests(unittest.TestCase):
         self.assertNotIn('>Macro<', panel)
         every_use = html.split('<table id="uses">')[1].split("</thead>")[0]
         self.assertIn('>Macro<', every_use)
+
+
+class UnreadWarningTests(unittest.TestCase):
+    LINK = '<a href="https://acme.zendesk.com/agent/tickets/{0}" target="_blank" rel="noopener">{0}</a>'
+
+    def result(self, unread=(), tickets=0, stopped_early=False, names_missing=False):
+        result = run_audit([use_macro(1, "First part.")], [1], "First part.")
+        result.coverage = Coverage(tickets, list(unread), stopped_early, names_missing)
+        return result
+
+    def render(self, unread, subdomain="acme", **coverage):
+        return render_html(self.result(unread, **coverage), subdomain)
+
+    def test_lists_and_links_each_ticket(self):
+        html = self.render([5, 1234], tickets=10)
+        self.assertIn(
+            '<div class="warning" role="note"><strong>2 tickets couldn\'t be read.</strong> Zendesk kept failing even '
+            "after several retries, so macro uses on the tickets below are missing from this report. Running it again "
+            "usually picks them up. The unread tickets are listed below and in <code>unread_tickets.csv</code>."
+            f'<div class="ids">{self.LINK.format(5)}, {self.LINK.format(1234)}</div></div>', html)
+
+    def test_one_ticket(self):
+        html = self.render([5], tickets=10)
+        self.assertIn("<strong>1 ticket couldn't be read.</strong>", html)
+        self.assertIn("macro uses on the ticket below", html)
+        self.assertIn("The unread ticket is listed below", html)
+
+    def test_stopped_early(self):
+        html = self.render([3, 4, 5], tickets=10, stopped_early=True)
+        self.assertIn(
+            '<div class="warning" role="note"><strong>This report is incomplete. The run stopped early because '
+            "Zendesk stopped answering.</strong> 7 of 10 tickets read. The percentages only cover the tickets that "
+            "were read. A later run should pick everything up. The unread tickets are listed below and in "
+            f'<code>unread_tickets.csv</code>.<div class="ids">{self.LINK.format(3)}, {self.LINK.format(4)}, '
+            f"{self.LINK.format(5)}</div></div>", html)
+        self.assertNotIn("couldn't be read", html)
+
+    def test_names_missing(self):
+        html = self.render([], names_missing=True)
+        self.assertIn('<div class="warning" role="note"><strong>Agent names are missing.</strong> Zendesk didn\'t '
+                      "answer when the tool asked for them, so agents are shown by ID.</div>", html)
+        self.assertEqual(html.count('class="warning"'), 1)
+
+    def test_both_boxes(self):
+        html = self.render([5], tickets=10, names_missing=True)
+        self.assertEqual(html.count('class="warning"'), 2)
+        self.assertLess(html.index("couldn't be read"), html.index("Agent names are missing"))
+
+    def test_no_links_without_a_subdomain(self):
+        self.assertIn('<div class="ids">5, 6</div>', self.render([5, 6], subdomain=None))
+
+    def test_comes_before_the_summary_tiles(self):
+        html = self.render([5], names_missing=True)
+        self.assertLess(html.index("Agent names are missing"), html.index('class="tiles"'))
+
+    def test_text_is_escaped(self):
+        self.assertIn('<div class="ids">1&lt;b&gt;</div>', self.render(["1<b>"], subdomain=None))
+        self.assertIn('<a href="https://acme.zendesk.com/agent/tickets/&quot;x" target="_blank" rel="noopener">&quot;x</a>', self.render(['"x']))
+
+    def test_nothing_when_every_ticket_was_read(self):
+        html = self.render([])
+        self.assertNotIn('class="warning"', html)
+        self.assertNotIn("couldn't be read", html)
+        self.assertRegex(html, r'what it means\.</div></div>\s*<div class="tiles">')
+
+    def test_styled_in_light_and_dark(self):
+        html = self.render([5])
+        self.assertIn("--warn-soft:#fdf3d7", html)
+        self.assertIn("--warn-soft:#3a2e12", html)
+        self.assertIn(".warning { background:var(--warn-soft)", html)
+        self.assertIn(".warning + .warning { margin-top:-12px; }", html)
+
+    def test_unread_tickets_csv(self):
+        with tempfile.TemporaryDirectory() as folder:
+            paths = write_all(Path(folder), self.result([5, 1234], tickets=10), "acme")
+            self.assertEqual(paths["unread"], Path(folder) / "unread_tickets.csv")
+            self.assertEqual(paths["unread"].read_bytes().decode(),
+                             "ticket_id,ticket_url\r\n5,https://acme.zendesk.com/agent/tickets/5\r\n"
+                             "1234,https://acme.zendesk.com/agent/tickets/1234\r\n")
+
+    def test_unread_tickets_csv_without_a_subdomain(self):
+        with tempfile.TemporaryDirectory() as folder:
+            paths = write_all(Path(folder), self.result([5]), None)
+            self.assertEqual(paths["unread"].read_bytes().decode(), "ticket_id,ticket_url\r\n5,\r\n")
+
+    def test_no_unread_tickets_csv_when_everything_was_read(self):
+        with tempfile.TemporaryDirectory() as folder:
+            paths = write_all(Path(folder), self.result([], names_missing=True), "acme")
+            self.assertNotIn("unread", paths)
+            self.assertFalse((Path(folder) / "unread_tickets.csv").exists())
 
 
 class ZendeskCountTests(unittest.TestCase):

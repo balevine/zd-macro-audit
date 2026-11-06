@@ -21,6 +21,7 @@ from pathlib import Path
 from zdaudit import analyze, report, sample, zendesk
 
 HERE = Path(__file__).resolve().parent
+MAX_IDS_SHOWN = 20  # ticket IDs listed in the terminal summary
 
 
 def clean_subdomain(value: str) -> str:
@@ -100,6 +101,23 @@ def print_summary(result: analyze.Result, paths: dict[str, Path]) -> None:
     skipped = sum(o["excluded"].values())
     if skipped:
         print(f"Not compared:         {skipped:,} (see the report for why)")
+    cov = result.coverage
+    unread = cov.unread
+    noun, them = ("ticket", "it") if len(unread) == 1 else ("tickets", "them")
+    if cov.stopped_early:
+        print(f"\nWarning: the run stopped early because Zendesk stopped answering. {cov.read:,} of "
+              f"{cov.tickets:,} tickets read, so these numbers only cover those. A later run should pick "
+              "everything up.")
+    elif unread:
+        print(f"\nWarning: {len(unread):,} {noun} couldn't be read after several retries, so macro uses on "
+              f"{them} are missing. Running again usually picks {them} up.")
+    if unread:
+        shown = ", ".join(str(t) for t in unread[:MAX_IDS_SHOWN])
+        more = f", and {len(unread) - MAX_IDS_SHOWN:,} more" if len(unread) > MAX_IDS_SHOWN else ""
+        print(f"  Unread {noun}: {shown}{more}")
+        print(f"  All listed in {paths['unread']}")
+    if cov.names_missing:
+        print("\nWarning: Zendesk didn't answer when asked for agent names, so agents are shown by ID.")
     print(f"\nReport: {paths['report']}")
     print(f"CSVs:   {paths['uses'].parent}")
 
@@ -146,7 +164,7 @@ def main(argv: list[str] | None = None) -> int:
     out_dir = Path(args.out) / datetime.now().strftime("%Y-%m-%d_%H%M%S")
     paths = report.write_all(out_dir, result, subdomain)
     print_summary(result, paths)
-    return 0
+    return 1 if result.coverage.stopped_early else 0
 
 
 if __name__ == "__main__":

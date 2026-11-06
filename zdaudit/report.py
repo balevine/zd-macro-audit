@@ -124,6 +124,12 @@ def write_all(out_dir: Path, result: Result, subdomain: str | None) -> dict[str,
     _write_rows_csv(paths["agents"], result.agents, [
         "agent_id", "name", "email", "uses", "compared", "edited", "unedited", "pct_uses_edited",
     ])
+    if result.coverage.unread:
+        paths["unread"] = out_dir / "unread_tickets.csv"
+        with paths["unread"].open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["ticket_id", "ticket_url"])
+            writer.writerows([t, ticket_url(subdomain, t)] for t in result.coverage.unread)
     paths["report"].write_text(render_html(result, subdomain), encoding="utf-8")
     return paths
 
@@ -286,6 +292,33 @@ def _excluded_rows(excluded: dict) -> str:
     )
 
 
+def _warnings(result: Result, subdomain: str | None) -> str:
+    """Boxes at the top of the page for anything the run couldn't read."""
+    cov = result.coverage
+    boxes = []
+    if cov.unread:
+        links = ", ".join(
+            f'<a href="{escape(ticket_url(subdomain, t))}" target="_blank" rel="noopener">{escape(str(t))}</a>'
+            if subdomain else escape(str(t))
+            for t in cov.unread
+        )
+        noun, verb = ("ticket", "is") if len(cov.unread) == 1 else ("tickets", "are")
+        if cov.stopped_early:
+            text = (f"<strong>This report is incomplete. The run stopped early because Zendesk stopped "
+                    f"answering.</strong> {cov.read:,} of {cov.tickets:,} tickets read. The percentages only "
+                    f"cover the tickets that were read. A later run should pick everything up.")
+        else:
+            text = (f"<strong>{len(cov.unread):,} {noun} couldn't be read.</strong> Zendesk kept failing even "
+                    f"after several retries, so macro uses on the {noun} below are missing from this report. "
+                    "Running it again usually picks them up.")
+        boxes.append(f'<div class="warning" role="note">{text} The unread {noun} {verb} listed below and in '
+                     f'<code>unread_tickets.csv</code>.<div class="ids">{links}</div></div>')
+    if cov.names_missing:
+        boxes.append('<div class="warning" role="note"><strong>Agent names are missing.</strong> Zendesk didn\'t '
+                     "answer when the tool asked for them, so agents are shown by ID.</div>")
+    return "\n  ".join(boxes)
+
+
 def _usage_note(result: Result) -> str:
     if not any(m["zendesk_usage_30d"] is not None for m in result.macros):
         return ""
@@ -397,7 +430,7 @@ def render_html(result: Result, subdomain: str | None) -> str:
   <h1>Macro edit report</h1>
   <div class="meta">{escape(account)} · {period} · generated {escape(generated)}
     <div class="sub">Point to any underlined label to see what it means.</div></div>
-
+  {_warnings(result, subdomain)}
   {_tiles(o)}
 
   <h2>Which macros get edited</h2>

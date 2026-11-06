@@ -8,7 +8,7 @@ from statistics import mean
 from typing import Iterable
 
 from .compare import compare, compile_macro, html_to_text
-from .zendesk import is_macro_event, parse_time
+from .zendesk import Coverage, is_macro_event, parse_time
 
 # Only these two statuses count toward the edited percentage.
 COUNTED = ("edited", "unedited")
@@ -56,6 +56,7 @@ class Result:
     overall: dict
     agents: list[dict]
     macros: list[dict]
+    coverage: Coverage = field(default_factory=Coverage)
 
 
 def macro_text(macro: dict) -> str | None:
@@ -79,7 +80,8 @@ def agent_name(users: dict[str, dict], agent_id: str) -> str:
 
 
 def analyze(audits: list[dict], macros: dict[str, dict], users: dict[str, dict],
-            dynamic: dict[str, list[str]], since: datetime, until: datetime) -> Result:
+            dynamic: dict[str, list[str]], since: datetime, until: datetime,
+            coverage: Coverage | None = None) -> Result:
     texts = {mid: macro_text(m) for mid, m in macros.items()}
     compiled = {mid: compile_macro(text, dynamic) for mid, text in texts.items() if text}
     uses: list[Use] = []
@@ -143,7 +145,8 @@ def analyze(audits: list[dict], macros: dict[str, dict], users: dict[str, dict],
                 added_text=status == "unedited" and added_text,
             ))
 
-    return Result(since, until, uses, users, _overall(uses), _by_agent(uses, users), _by_macro(uses, macros))
+    return Result(since, until, uses, users, _overall(uses), _by_agent(uses, users), _by_macro(uses, macros),
+                  coverage or Coverage())
 
 
 def _pct(part: int, whole: int) -> float | None:

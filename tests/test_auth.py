@@ -1,8 +1,10 @@
 import base64
 import hashlib
+import http.client
 import io
 import json
 import socket
+import ssl
 import tempfile
 import threading
 import time
@@ -28,6 +30,19 @@ def http_error(code, body=b"", retry_after=None):
 
 def reply(data):
     return io.BytesIO(json.dumps(data).encode())
+
+
+class BrokenReply(io.BytesIO):
+    """A reply whose body fails partway through reading."""
+    def __init__(self, error):
+        super().__init__()
+        self.error = error
+
+    def read(self, *args):
+        raise self.error
+
+
+BACKOFF = [1, 2, 4, 8, 16, 32, 60]  # the waits between 8 tries
 
 
 def sent_header(request):
@@ -202,6 +217,42 @@ class LoginTests(OAuthTestCase):
                 self.zd.login()
 
 
+class RetryAfterTests(OAuthTestCase):
+    NOW = 1_800_000_000  # 2027-01-15 08:00:00 UTC
+
+    def wait_for(self, retry_after):
+        with mock.patch("urllib.request.urlopen", side_effect=[http_error(429, retry_after=retry_after), reply({})]), \
+                mock.patch("time.time", return_value=self.NOW):
+            self.zd.get("/x")
+        self.assertEqual(self.sleep.call_count, 1)
+        return self.sleep.call_args[0][0]
+
+    def test_seconds(self):
+        self.assertEqual(self.wait_for("7"), 7.0)
+        self.print.assert_called_once_with("  Zendesk asked us to slow down. Waiting 7s...")
+
+    def test_http_date(self):
+        self.assertEqual(self.wait_for("Fri, 15 Jan 2027 08:00:42 GMT"), 42.0)
+
+    def test_date_in_another_zone(self):
+        self.assertEqual(self.wait_for("Fri, 15 Jan 2027 09:00:42 +0100"), 42.0)
+
+    def test_date_without_a_zone_is_read_as_utc(self):
+        self.assertEqual(self.wait_for("Fri, 15 Jan 2027 08:00:42 -0000"), 42.0)
+
+    def test_garbage_falls_back_to_the_normal_wait(self):
+        self.assertEqual(self.wait_for("soon"), 1)
+
+    def test_kept_between_zero_and_five_minutes(self):
+        self.assertEqual(self.wait_for("1000"), 300)
+        self.sleep.reset_mock()
+        self.assertEqual(self.wait_for("Fri, 15 Jan 2027 09:00:00 GMT"), 300)
+        self.sleep.reset_mock()
+        self.assertEqual(self.wait_for("-5"), 0)
+        self.sleep.reset_mock()
+        self.assertEqual(self.wait_for("Fri, 15 Jan 2027 07:59:00 GMT"), 0)
+
+
 class RefreshTests(OAuthTestCase):
     def test_keeps_the_old_refresh_token_when_none_comes_back(self):
         self.zd.token = {"access_token": "old", "refresh_token": "keep"}
@@ -230,8 +281,34 @@ class RefreshTests(OAuthTestCase):
 
     def test_rejected_refresh(self):
         self.zd.token = {"access_token": "old", "refresh_token": "r"}
-        with mock.patch("urllib.request.urlopen", side_effect=http_error(400)):
+        with mock.patch("urllib.request.urlopen", side_effect=http_error(400)) as urlopen:
             self.assertFalse(self.zd._refresh("old"))
+        self.assertEqual(urlopen.call_count, 1)
+        self.sleep.assert_not_called()
+
+    def test_network_error_during_refresh_is_retried(self):
+        self.zd.token = {"access_token": "old", "refresh_token": "r"}
+        with mock.patch("urllib.request.urlopen",
+                        side_effect=[ConnectionResetError(54, "reset"), TimeoutError(), reply({"access_token": "new"})]):
+            self.assertTrue(self.zd._refresh("old"))
+        self.assertEqual([c[0][0] for c in self.sleep.call_args_list], [1, 2])
+        self.assertEqual(self.saved()["access_token"], "new")
+
+    def test_refresh_that_never_connects_gives_up_cleanly(self):
+        self.zd.token = {"access_token": "old", "refresh_token": "r"}
+        with mock.patch("urllib.request.urlopen", side_effect=[http_error(401)] + [ConnectionResetError()] * 8) as urlopen:
+            with self.assertRaises(ZendeskError) as caught:
+                self.zd.get("/api/v2/x.json")
+        self.assertTrue(caught.exception.gave_up)
+        self.assertEqual(str(caught.exception), "Gave up on https://acme.zendesk.com/oauth/tokens after several retries.")
+        self.assertEqual(urlopen.call_count, 9)
+
+    def test_code_exchange_retries_network_errors(self):
+        with mock.patch("urllib.request.urlopen",
+                        side_effect=[http.client.RemoteDisconnected("closed"), reply({"access_token": "t"})]) as urlopen:
+            self.assertEqual(self.zd._post_token({"grant_type": "authorization_code"}), {"access_token": "t"})
+        self.assertEqual(urlopen.call_count, 2)
+        self.sleep.assert_called_once_with(1)
 
 
 class RequestTests(OAuthTestCase):
@@ -265,7 +342,7 @@ class RequestTests(OAuthTestCase):
         with self.assertRaisesRegex(ZendeskError, "Gave up"):
             self.get(*[http_error(500) for _ in range(8)])
         self.assertEqual(self.urlopen.call_count, 8)
-        self.assertEqual(self.sleep.call_args[0][0], 60)
+        self.assertEqual([c[0][0] for c in self.sleep.call_args_list], BACKOFF)
 
     def test_client_error_stops_at_once(self):
         with self.assertRaises(ZendeskError) as caught:
@@ -291,6 +368,75 @@ class RequestTests(OAuthTestCase):
         with mock.patch.object(self.zd, "_refresh", return_value=False):
             with self.assertRaises(AuthError):
                 self.get(http_error(401))
+
+    def test_each_kind_of_network_trouble_is_retried(self):
+        cases = {
+            "URLError": urllib.error.URLError("down"),
+            "timeout": TimeoutError("timed out"),
+            "timeout while reading": BrokenReply(TimeoutError("timed out")),
+            "connection reset": ConnectionResetError(54, "Connection reset by peer"),
+            "remote disconnected": http.client.RemoteDisconnected("Remote end closed connection"),
+            "incomplete read": BrokenReply(http.client.IncompleteRead(b"{", 10)),
+            "cut-off JSON": io.BytesIO(b'{"ok": '),
+            "proxy page": io.BytesIO(b"<html>Gateway</html>"),
+            "not text": io.BytesIO(b"\x80\x81"),
+        }
+        for name, failure in cases.items():
+            with self.subTest(name):
+                self.sleep.reset_mock()
+                self.assertEqual(self.get(failure, reply({"ok": 1})), {"ok": 1})
+                self.assertEqual(self.urlopen.call_count, 2)
+                self.sleep.assert_called_once_with(1)
+
+    def test_retry_message_describes_each_kind(self):
+        cases = [(urllib.error.URLError("down"), "down"),
+                 (ConnectionResetError(54, "reset"), "[Errno 54] reset"),
+                 (TimeoutError(), "TimeoutError"),
+                 (io.BytesIO(b"<html>"), "the reply was cut off or wasn't JSON")]
+        for failure, described in cases:
+            with self.subTest(described):
+                self.get(failure, reply({}))
+                self.print.assert_called_with(f"  Network error ({described}). Retrying in 1s...")
+
+    def test_network_trouble_gives_up_after_eight_tries(self):
+        with self.assertRaises(ZendeskError) as caught:
+            self.get(*[TimeoutError()] * 8)
+        self.assertTrue(caught.exception.gave_up)
+        self.assertIsNone(caught.exception.status)
+        self.assertEqual(str(caught.exception), "Gave up on https://acme.zendesk.com/api/v2/x.json after several retries.")
+        self.assertEqual(self.urlopen.call_count, 8)
+        self.assertEqual([c[0][0] for c in self.sleep.call_args_list], BACKOFF)
+
+    def test_client_error_is_not_marked_as_gave_up(self):
+        with self.assertRaises(ZendeskError) as caught:
+            self.get(http_error(400))
+        self.assertFalse(caught.exception.gave_up)
+
+    def test_certificate_error_stops_at_once(self):
+        cert = ssl.SSLCertVerificationError(1, "certificate verify failed")
+        for failure in (urllib.error.URLError(cert), cert):
+            with self.subTest(type(failure).__name__):
+                with self.assertRaisesRegex(ZendeskError, "Couldn't verify the security certificate") as caught:
+                    self.get(failure, reply({}))
+                self.assertIn("company network or proxy", str(caught.exception))
+                self.assertFalse(caught.exception.gave_up)
+                self.assertEqual(self.urlopen.call_count, 1)
+                self.sleep.assert_not_called()
+
+    def test_unknown_subdomain_stops_at_once(self):
+        lookup = socket.gaierror(8, "nodename nor servname provided, or not known")
+        with self.assertRaises(ZendeskError) as caught:
+            self.get(urllib.error.URLError(lookup), reply({}))
+        self.assertEqual(str(caught.exception), "Couldn't find acme.zendesk.com. Check the Zendesk subdomain.")
+        self.assertFalse(caught.exception.gave_up)
+        self.assertEqual(self.urlopen.call_count, 1)
+        self.sleep.assert_not_called()
+
+    def test_failed_lookup_after_zendesk_answered_is_retried(self):
+        self.get(reply({}))
+        lookup = socket.gaierror(8, "nodename nor servname provided, or not known")
+        self.assertEqual(self.get(urllib.error.URLError(lookup), reply({"ok": 1})), {"ok": 1})
+        self.sleep.assert_called_once_with(1)
 
     def test_api_token_never_refreshes(self):
         self.zd.api_token = "t"

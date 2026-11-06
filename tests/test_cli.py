@@ -8,7 +8,8 @@ from pathlib import Path
 from unittest import mock
 
 import zd_macro_audit
-from zdaudit.zendesk import AuthError
+from tests.test_fetch import MACRO_PATH, FakeZendesk, audits_path, base_pages, gave_up
+from zdaudit.zendesk import AuthError, Coverage, ZendeskError
 
 NO_ENV = {env: "" for env in zd_macro_audit.ENV_VARS.values()}
 
@@ -155,6 +156,126 @@ class RunTests(TempFolderTest):
             with mock.patch.object(zd_macro_audit, "load_config", wraps=zd_macro_audit.load_config) as load:
                 self.run_main(flag)
             self.assertEqual(load.call_args[0][1], auth)
+
+    def fetched(self, unread, tickets=100, **coverage):
+        return {"audits": [], "macros": {}, "users": {}, "dynamic": {},
+                "coverage": Coverage(tickets, unread, **coverage)}
+
+    def report_folder(self):
+        return next((self.dir / "reports").iterdir())
+
+    def test_unread_tickets_are_warned_about(self):
+        self.signed_in(self.fetched([5, 1234]))
+        code, out, _ = self.run_main()
+        self.assertEqual(code, 0)
+        folder = self.report_folder()
+        self.assertIn("\nWarning: 2 tickets couldn't be read after several retries, so macro uses on them are "
+                      "missing. Running again usually picks them up.\n  Unread tickets: 5, 1234\n"
+                      f"  All listed in {folder / 'unread_tickets.csv'}\n\nReport: ", out)
+        self.assertIn('<a href="https://acme.zendesk.com/agent/tickets/1234" target="_blank" rel="noopener">1234</a>',
+                      (folder / "report.html").read_text(encoding="utf-8"))
+        self.assertEqual((folder / "unread_tickets.csv").read_text(encoding="utf-8").splitlines()[1:],
+                         ["5,https://acme.zendesk.com/agent/tickets/5", "1234,https://acme.zendesk.com/agent/tickets/1234"])
+
+    def test_one_unread_ticket(self):
+        self.signed_in(self.fetched([5]))
+        _, out, _ = self.run_main()
+        self.assertIn("Warning: 1 ticket couldn't be read after several retries, so macro uses on it are missing. "
+                      "Running again usually picks it up.\n  Unread ticket: 5\n", out)
+
+    def test_long_list_of_unread_tickets_is_cut_short(self):
+        self.signed_in(self.fetched(list(range(1, 26))))
+        _, out, _ = self.run_main()
+        self.assertIn("Warning: 25 tickets couldn't", out)
+        shown = ", ".join(str(i) for i in range(1, 21))
+        self.assertIn(f"  Unread tickets: {shown}, and 5 more\n  All listed in ", out)
+
+    def test_exactly_twenty_unread_tickets_are_all_shown(self):
+        self.signed_in(self.fetched(list(range(1, 21))))
+        _, out, _ = self.run_main()
+        self.assertIn("  Unread tickets: " + ", ".join(str(i) for i in range(1, 21)) + "\n", out)
+
+    def test_stopped_early_writes_a_partial_report_and_exits_1(self):
+        self.signed_in(self.fetched(list(range(1, 31)), tickets=100, stopped_early=True))
+        code, out, err = self.run_main()
+        self.assertEqual((code, err), (1, ""))
+        folder = self.report_folder()
+        self.assertIn("\nWarning: the run stopped early because Zendesk stopped answering. 70 of 100 tickets read, "
+                      "so these numbers only cover those. A later run should pick everything up.\n"
+                      "  Unread tickets: " + ", ".join(str(i) for i in range(1, 21)) + ", and 10 more\n"
+                      f"  All listed in {folder / 'unread_tickets.csv'}\n", out)
+        self.assertNotIn("couldn't be read", out)
+        self.assertIn("70 of 100 tickets read.", (folder / "report.html").read_text(encoding="utf-8"))
+        self.assertEqual(len((folder / "unread_tickets.csv").read_text(encoding="utf-8").splitlines()), 31)
+
+    def test_names_missing_is_warned_about(self):
+        self.signed_in(self.fetched([], names_missing=True))
+        code, out, _ = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertIn("\nWarning: Zendesk didn't answer when asked for agent names, so agents are shown by ID.\n"
+                      "\nReport: ", out)
+        self.assertNotIn("Unread", out)
+        self.assertFalse((self.report_folder() / "unread_tickets.csv").exists())
+
+    def test_no_warning_when_every_ticket_was_read(self):
+        self.signed_in(self.fetched([]))
+        code, out, _ = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertNotIn("Warning", out)
+        self.assertNotIn("Unread", out)
+        code, out, _ = self.run_main("--sample")
+        self.assertEqual(code, 0)
+        self.assertNotIn("Warning", out)
+
+    def test_network_error_is_reported_without_a_traceback(self):
+        self.signed_in(error=ZendeskError("Couldn't find acme.zendesk.com. Check the Zendesk subdomain."))
+        code, out, err = self.run_main()
+        self.assertEqual(code, 1)
+        self.assertEqual(err, "\nError: Couldn't find acme.zendesk.com. Check the Zendesk subdomain.\n")
+
+    def fake_account(self, errors):
+        """A run against made-up Zendesk answers, from sign-in to report."""
+        self.path.write_text(json.dumps({"subdomain": "acme", "email": "a@acme.com", "api_token": "t"}))
+        fake = FakeZendesk(base_pages(), {audits_path(3): 404, "/api/v2/macros/56.json": 404, **errors})
+        fake.authenticate = lambda force=False: None
+        # main() picks its own start time, so answer the export whatever second it asks for.
+        export = next(url for url in fake.pages if url.startswith("/api/v2/incremental/"))
+        answer = fake.get
+        fake.get = lambda url: answer(export if url.startswith("/api/v2/incremental/") else url)
+        patcher = mock.patch.object(zd_macro_audit.zendesk, "Zendesk", return_value=fake)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_names_that_never_arrive_still_give_a_report(self):
+        self.fake_account({"/api/v2/users/show_many.json?ids=7": gave_up()})
+        code, out, _ = self.run_main()
+        self.assertEqual(code, 0)
+        html = (self.report_folder() / "report.html").read_text(encoding="utf-8")
+        self.assertIn("Agent names are missing.", html)
+        self.assertIn("<td>User 7<div class='sub'></div></td>", html)
+        self.assertIn("Warning: Zendesk didn't answer when asked for agent names", out)
+
+    def test_macros_that_never_arrive_give_no_report(self):
+        self.fake_account({MACRO_PATH + "&include=usage_30d": gave_up()})
+        code, _, err = self.run_main()
+        self.assertEqual(code, 1)
+        self.assertEqual(err, "\nError: Zendesk stopped answering while the tool was fetching macros, so there's no "
+                              "report. 3 of 3 tickets were read, but the report needs the macros' text. A later run "
+                              "should pick everything up.\n")
+        self.assertFalse((self.dir / "reports").exists())
+
+    def test_no_ticket_read_gives_no_report(self):
+        self.fake_account({audits_path(t): gave_up() for t in (1, 2, 3)})
+        code, _, err = self.run_main()
+        self.assertEqual(code, 1)
+        self.assertIn("none of the 3 tickets could be read", err)
+        self.assertFalse((self.dir / "reports").exists())
+
+    def test_a_few_unread_tickets_after_a_full_run_exit_0(self):
+        self.fake_account({audits_path(2): gave_up()})
+        code, out, _ = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertIn("  Unread ticket: 2\n", out)
 
     def test_sign_in_error_is_reported(self):
         self.signed_in(error=AuthError("nope"))
