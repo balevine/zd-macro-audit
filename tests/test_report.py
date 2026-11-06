@@ -125,6 +125,19 @@ class PageDataTests(unittest.TestCase):
         self.assertEqual(html.count("</script>"), 2)
         self.assertEqual(page_data(html)["uses"][0]["title"], "</script><b>bad</b>")
 
+    def test_comment_markers_cannot_keep_the_page_data_open(self):
+        # After "<!--" and "<script", a browser no longer treats "</script>" as the end of the block.
+        title = "Refund <!--<script> note </script><b>bad</b>"
+        agent = "Ana <!--<script>"
+        result = run_audits([use_macro(1, "First part.", title=title)], [make_audit([1], "First part.")],
+                            {"7": {"name": agent}})
+        html = render_html(result, "acme")
+        block = re.search(r'id="report-data">(.*?)</script>', html, re.S).group(1)
+        self.assertEqual(block.count("<"), 0)
+        self.assertEqual(html.count("</script>"), 2)
+        use = page_data(html)["uses"][0]
+        self.assertEqual((use["title"], use["agent"]), (title, agent))
+
 
 class PageTests(unittest.TestCase):
     def render(self, macros, audits, subdomain="acme", **run):

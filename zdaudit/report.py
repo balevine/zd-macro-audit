@@ -405,12 +405,13 @@ def render_html(result: Result, subdomain: str | None) -> str:
     has_usage = any(m["zendesk_usage_30d"] is not None for m in result.macros)
     usage_th = th("Zendesk count", "zendesk_count", right=True) if has_usage else ""
 
-    # "</" is escaped so that text from a comment can't close the script tag.
+    # Every "<" becomes the JSON escape \u003c, so text from a macro title, agent name or comment
+    # can't close the script tag or confuse the browser with "<!--" and "<script". JSON.parse turns it back.
     report_data = json.dumps({
         "uses": _use_data(result, subdomain),
         "labels": STATUS_LABELS,
         "tips": BADGE_TIPS,
-    }).replace("</", "<\\/")
+    }).replace("<", "\\u003c")
 
     status_options = "".join(
         f'<option value="{s}">{escape(label)}</option>' for s, label in STATUS_LABELS.items()
