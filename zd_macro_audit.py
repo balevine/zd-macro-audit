@@ -88,8 +88,7 @@ def load_config(path: Path, auth: str | None = None) -> dict:
     if not all(config[key] for key in required):
         sys.exit("Missing settings: " + ", ".join(k for k in required if not config[k]))
     if asked:
-        path.write_text(json.dumps(saved, indent=2) + "\n")
-        os.chmod(path, 0o600)
+        zendesk.write_private(path, json.dumps(saved, indent=2) + "\n")
         print(f"Saved to {path.name}. Delete that file to start over.\n")
     return config
 

@@ -3,14 +3,17 @@ import hashlib
 import http.client
 import io
 import json
+import os
 import socket
 import ssl
+import stat
 import tempfile
 import threading
 import time
 import unittest
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from email.message import Message
 from pathlib import Path
@@ -53,6 +56,64 @@ def refused(where):
 
 def sent_header(request):
     return request.get_header("Authorization")
+
+
+def mode(path):
+    return stat.S_IMODE(os.stat(path).st_mode)
+
+
+@contextmanager
+def modes_while_writing():
+    """Collect each private file's mode just before its text is written, with a umask that takes nothing away.
+
+    Under umask 0 a file created with the default 0666 stays readable by everyone, so only creating it
+    as 0600 (or tightening it before writing) gives [0o600]. Code that writes without going through
+    write_private records nothing.
+    """
+    seen = []
+    real_fdopen = os.fdopen
+
+    def fdopen(fd, *args, **kwargs):
+        seen.append(stat.S_IMODE(os.fstat(fd).st_mode))
+        return real_fdopen(fd, *args, **kwargs)
+
+    old_umask = os.umask(0)
+    try:
+        with mock.patch("os.fdopen", fdopen):
+            yield seen
+    finally:
+        os.umask(old_umask)
+
+
+class WritePrivateTests(unittest.TestCase):
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.path = Path(folder.name) / "secret.json"
+
+    def test_new_file_is_never_readable_by_others(self):
+        with modes_while_writing() as seen:
+            zendesk.write_private(self.path, "s3cret")
+        self.assertEqual(seen, [0o600])
+        self.assertEqual(mode(self.path), 0o600)
+        self.assertEqual(self.path.read_text(), "s3cret")
+
+    def test_existing_open_file_is_tightened_before_writing(self):
+        self.path.write_text("an older, longer secret")
+        os.chmod(self.path, 0o644)
+        with modes_while_writing() as seen:
+            zendesk.write_private(self.path, "new")
+        self.assertEqual(seen, [0o600])
+        self.assertEqual(mode(self.path), 0o600)
+        self.assertEqual(self.path.read_text(), "new")
+
+    def test_created_as_0600_not_tightened_afterwards(self):
+        # Even an empty file shouldn't exist wider than 0600 between creating and tightening it.
+        real_open = os.open
+        with mock.patch("os.open", side_effect=lambda *a: real_open(*a)) as opened:
+            zendesk.write_private(self.path, "s3cret")
+        self.assertEqual(opened.call_args_list,
+                         [mock.call(self.path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)])
 
 
 class TokenSignInTests(unittest.TestCase):
@@ -193,6 +254,16 @@ class LoginTests(OAuthTestCase):
         self.assertEqual(self.saved()["access_token"], "new")
         self.assertEqual(self.zd.token_path.stat().st_mode & 0o777, 0o600)
         self.assertEqual(sent_header(self.requests[1]), "Bearer new")
+
+    def test_token_file_is_never_readable_by_others(self):
+        self.tokens.mkdir()
+        self.zd.token_path.write_text("an older, longer saved token")
+        os.chmod(self.zd.token_path, 0o644)
+        with modes_while_writing() as seen:
+            self.login(lambda state: {"code": "abc", "state": state}, {"access_token": "new", "refresh_token": "r"})
+        self.assertEqual(seen, [0o600])
+        self.assertEqual(mode(self.zd.token_path), 0o600)
+        self.assertEqual(self.zd.token_path.read_text(), '{"access_token": "new", "refresh_token": "r"}')
 
     def webbrowser_url(self):
         return self.open.call_args[0][0]

@@ -113,6 +113,15 @@ def _describe(exc: BaseException) -> str:
     return str(exc) or type(exc).__name__
 
 
+def write_private(path: Path, text: str) -> None:
+    """Write a file only its owner can read."""
+    # Created as 0600 and tightened before writing, so the secret is never readable by others, even briefly.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
 def _pkce_pair() -> tuple[str, str]:
     verifier = secrets.token_urlsafe(64)
     digest = hashlib.sha256(verifier.encode()).digest()
@@ -310,8 +319,7 @@ class Zendesk:
             token["refresh_token"] = self.token["refresh_token"]
         self.token = token
         self.token_path.parent.mkdir(parents=True, exist_ok=True)
-        self.token_path.write_text(json.dumps(token))
-        os.chmod(self.token_path, 0o600)
+        write_private(self.token_path, json.dumps(token))
 
     # ---- Requests ----------------------------------------------------------
 

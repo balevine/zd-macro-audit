@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 import zd_macro_audit
+from tests.test_auth import mode, modes_while_writing
 from tests.test_fetch import MACRO_PATH, FakeZendesk, audits_path, base_pages, gave_up
 from zdaudit.zendesk import AuthError, Coverage, ZendeskError
 
@@ -65,6 +66,16 @@ class ConfigTests(TempFolderTest):
         saved = json.loads(self.path.read_text())
         self.assertEqual((saved["subdomain"], saved["api_token"]), ("acme", "abc123"))
         self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+
+    def test_config_file_is_never_readable_by_others(self):
+        self.path.write_text(json.dumps({"subdomain": "acme"}))
+        os.chmod(self.path, 0o644)
+        with modes_while_writing() as seen:
+            self.load(answers=["2", "admin@acme.com"], secrets=["abc123"])
+        self.assertEqual(seen, [0o600])
+        self.assertEqual(mode(self.path), 0o600)
+        self.assertEqual(self.path.read_text(), json.dumps(
+            {"subdomain": "acme", "email": "admin@acme.com", "api_token": "abc123"}, indent=2) + "\n")
 
     def test_first_run_with_oauth_is_the_default_choice(self):
         config = self.load(answers=["acme", "", "my_client"], secrets=["shh"])
