@@ -302,16 +302,20 @@ def _excluded_rows(excluded: dict) -> str:
     )
 
 
+def _ticket_links(ticket_ids: list[int], subdomain: str | None) -> str:
+    return ", ".join(
+        f'<a href="{escape(ticket_url(subdomain, t))}" target="_blank" rel="noopener">{escape(str(t))}</a>'
+        if subdomain else escape(str(t))
+        for t in ticket_ids
+    )
+
+
 def _warnings(result: Result, subdomain: str | None) -> str:
     """Boxes at the top of the page for anything the run couldn't read."""
     cov = result.coverage
     boxes = []
     if cov.unread:
-        links = ", ".join(
-            f'<a href="{escape(ticket_url(subdomain, t))}" target="_blank" rel="noopener">{escape(str(t))}</a>'
-            if subdomain else escape(str(t))
-            for t in cov.unread
-        )
+        links = _ticket_links(cov.unread, subdomain)
         noun, verb = ("ticket", "is") if len(cov.unread) == 1 else ("tickets", "are")
         if cov.stopped_early:
             text = (f"<strong>This report is incomplete. The run stopped early because Zendesk stopped "
@@ -326,6 +330,18 @@ def _warnings(result: Result, subdomain: str | None) -> str:
     if cov.names_missing:
         boxes.append('<div class="warning" role="note"><strong>Agent names are missing.</strong> Zendesk didn\'t '
                      "answer when the tool asked for them, so agents are shown by ID.</div>")
+    if cov.skipped:
+        # Not a failure, so a plain note rather than a warning.
+        one = len(cov.skipped) == 1
+        noun, verb, it, its = ("ticket", "was", "it", "it's") if one else ("tickets", "were", "them", "they're")
+        gap = ""
+        if any(m["zendesk_usage_30d"] is not None for m in result.macros):
+            gap = ', which can explain why this report finds fewer uses than the "Zendesk count" column'
+        boxes.append(f'<div class="notice" role="note"><strong>{len(cov.skipped):,} {noun} {verb} skipped.</strong> '
+                     f"{'It was' if one else 'They were'} deleted, or this sign-in isn't allowed to see {it} "
+                     f"(for example, {its} restricted to a group). Macro uses on {it} aren't counted{gap}. "
+                     f"The skipped {noun} {'is' if one else 'are'} listed below."
+                     f'<div class="ids">{_ticket_links(cov.skipped, subdomain)}</div></div>')
     return "\n  ".join(boxes)
 
 

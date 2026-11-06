@@ -255,6 +255,56 @@ class PageTests(unittest.TestCase):
         self.assertIn('>Macro<', every_use)
 
 
+class SkippedNoteTests(unittest.TestCase):
+    LINK = '<a href="https://acme.zendesk.com/agent/tickets/{0}" target="_blank" rel="noopener">{0}</a>'
+
+    def render(self, skipped, subdomain="acme", usage=4, unread=(), names_missing=False):
+        result = run_audit([use_macro(1, "First part.", usage_30d=usage)], [1], "First part.")
+        result.coverage = Coverage(10, list(unread), False, names_missing, list(skipped))
+        return render_html(result, subdomain)
+
+    def test_lists_and_links_each_ticket(self):
+        html = self.render([4, 8, 15])
+        self.assertIn(
+            '<div class="notice" role="note"><strong>3 tickets were skipped.</strong> They were deleted, or this '
+            "sign-in isn't allowed to see them (for example, they're restricted to a group). Macro uses on them "
+            'aren\'t counted, which can explain why this report finds fewer uses than the "Zendesk count" column. '
+            f'The skipped tickets are listed below.<div class="ids">{self.LINK.format(4)}, {self.LINK.format(8)}, '
+            f"{self.LINK.format(15)}</div></div>", html)
+        self.assertNotIn('class="warning"', html)
+
+    def test_one_ticket(self):
+        self.assertIn(
+            '<div class="notice" role="note"><strong>1 ticket was skipped.</strong> It was deleted, or this '
+            "sign-in isn't allowed to see it (for example, it's restricted to a group). Macro uses on it "
+            'aren\'t counted, which can explain why this report finds fewer uses than the "Zendesk count" column. '
+            f'The skipped ticket is listed below.<div class="ids">{self.LINK.format(4)}</div></div>',
+            self.render([4]))
+
+    def test_no_zendesk_count_column_means_no_mention_of_it(self):
+        html = self.render([4, 8], subdomain=None, usage=None)
+        self.assertIn("Macro uses on them aren't counted. The skipped tickets are listed below."
+                      '<div class="ids">4, 8</div></div>', html)
+        self.assertNotIn("Zendesk count", html)
+
+    def test_comes_after_the_warnings(self):
+        html = self.render([4], unread=[5], names_missing=True)
+        self.assertEqual(html.count('class="notice"'), 1)
+        self.assertLess(html.index("Agent names are missing"), html.index("1 ticket was skipped"))
+        self.assertLess(html.index("1 ticket was skipped"), html.index('class="tiles"'))
+
+    def test_nothing_when_none_were_skipped(self):
+        html = self.render([])
+        self.assertNotIn('class="notice"', html)
+        self.assertNotIn("skipped", html)
+        self.assertRegex(html, r'what it means\.</div></div>\s*<div class="tiles">')
+
+    def test_styled_in_light_and_dark(self):
+        html = self.render([4])
+        self.assertIn(".notice { background:var(--surface); border:1px solid var(--border);", html)
+        self.assertIn(".warning .ids, .notice .ids {", html)
+
+
 class UnreadWarningTests(unittest.TestCase):
     LINK = '<a href="https://acme.zendesk.com/agent/tickets/{0}" target="_blank" rel="noopener">{0}</a>'
 
@@ -323,7 +373,7 @@ class UnreadWarningTests(unittest.TestCase):
         self.assertIn("--warn-soft:#fdf3d7", html)
         self.assertIn("--warn-soft:#3a2e12", html)
         self.assertIn(".warning { background:var(--warn-soft)", html)
-        self.assertIn(".warning + .warning { margin-top:-12px; }", html)
+        self.assertIn(".warning + .warning, .warning + .notice { margin-top:-12px; }", html)
 
     def test_unread_tickets_csv(self):
         with tempfile.TemporaryDirectory() as folder:

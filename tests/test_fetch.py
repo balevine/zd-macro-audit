@@ -128,8 +128,14 @@ class FetchTests(unittest.TestCase):
         fake = FakeZendesk({audits_path(1): {"audits": [at_start], "meta": {"has_more": False}}})
         self.assertEqual(len(zendesk.fetch_ticket_macro_audits(fake, 1, SINCE)), 1)
 
-    def test_hidden_ticket_is_skipped(self):
-        fake = FakeZendesk({}, {audits_path(1): 403})
+    def test_hidden_or_deleted_ticket_is_skipped(self):
+        for status in (403, 404):
+            with self.subTest(status):
+                fake = FakeZendesk({}, {audits_path(1): status})
+                self.assertIsNone(zendesk.fetch_ticket_macro_audits(fake, 1, SINCE))
+
+    def test_ticket_with_no_macro_uses_is_not_skipped(self):
+        fake = FakeZendesk({audits_path(1): {"audits": [audit(10, 1, 2)], "meta": {"has_more": False}}})
         self.assertEqual(zendesk.fetch_ticket_macro_audits(fake, 1, SINCE), [])
 
     def test_progress_is_reported(self):
@@ -208,6 +214,53 @@ class UnreadTicketTests(unittest.TestCase):
     def test_skipped_ticket_counts_as_read(self):
         coverage = self.run_fetch({audits_path(2): gave_up()})["coverage"]
         self.assertEqual((coverage.tickets, coverage.read, coverage.stopped_early), (3, 2, False))
+
+
+class SkippedTicketTests(unittest.TestCase):
+    """Tickets deleted or hidden from this sign-in after the export listed them are skipped and listed."""
+    def fetch(self, errors, working=(1, 3, 5), workers=2):
+        pages = export([1, 2, 3, 4, 5])
+        pages.update({audits_path(t): one_use(t) for t in working})
+        self.fake = FakeZendesk(pages, errors)
+        return zendesk.fetch_macro_audits(self.fake, SINCE, lambda _: None, workers=workers)
+
+    def test_hidden_and_deleted_tickets_are_listed(self):
+        audits, coverage = self.fetch({audits_path(2): 403, audits_path(4): 404})
+        self.assertEqual(coverage, zendesk.Coverage(5, [], False, False, [2, 4]))
+        self.assertEqual(coverage.read, 5)
+        self.assertEqual(sorted(a["ticket_id"] for a in audits), [1, 3, 5])
+        self.assertEqual(self.fake.calls.count(audits_path(2)), 1, "not tried again")
+        self.assertEqual(self.fake.calls.count(audits_path(4)), 1, "not tried again")
+
+    @mock.patch.object(zendesk, "as_completed", lambda futures: reversed(list(futures)))
+    def test_listed_in_order(self):
+        # Results arrive last ticket first, so the list has to be sorted.
+        audits, coverage = self.fetch({audits_path(t): 404 for t in (5, 1, 3)}, working=(2, 4), workers=1)
+        self.assertEqual(coverage.skipped, [1, 3, 5])
+        self.assertEqual(sorted(a["ticket_id"] for a in audits), [2, 4])
+
+    def test_skipped_on_the_retry_at_the_end(self):
+        for status in (403, 404):
+            with self.subTest(status):
+                audits, coverage = self.fetch({audits_path(2): [gave_up(), status]}, working=(1, 3, 4, 5))
+                self.assertEqual(coverage, zendesk.Coverage(5, [], False, False, [2]))
+                self.assertEqual(self.fake.calls.count(audits_path(2)), 2)
+                self.assertEqual(sorted(a["ticket_id"] for a in audits), [1, 3, 4, 5])
+
+    def test_skipped_and_unread_are_kept_apart(self):
+        audits, coverage = self.fetch({audits_path(2): gave_up(), audits_path(4): 404})
+        self.assertEqual(coverage, zendesk.Coverage(5, [2], False, False, [4]))
+        self.assertEqual(coverage.read, 4)
+
+    def test_none_skipped(self):
+        _, coverage = self.fetch({}, working=(1, 2, 3, 4, 5))
+        self.assertEqual(coverage, zendesk.Coverage(5, [], False, False, []))
+
+    def test_skipped_tickets_reach_the_result(self):
+        fake = FakeZendesk(base_pages(), {audits_path(3): 404, "/api/v2/macros/56.json": 404})
+        data = zendesk.fetch_all(fake, SINCE, log=lambda _: None, workers=2)
+        self.assertEqual(data["coverage"], zendesk.Coverage(3, [], False, False, [3]))
+        self.assertEqual(analyze(**data, since=SINCE, until=NOW).coverage.skipped, [3])
 
 
 def export(ids):
@@ -291,6 +344,19 @@ class EarlyStopTests(unittest.TestCase):
         self.assertFalse(coverage.stopped_early)
         self.assertEqual(coverage.unread, first + second)
 
+    def test_a_ticket_skipped_while_stopping_is_listed_as_skipped(self):
+        failing, working = list(range(1, self.STREAK + 1)), list(range(100, 130))
+        pages = export(failing + working)
+        pages.update({audits_path(t): one_use(t) for t in working})
+        errors = {audits_path(t): gave_up() for t in failing}
+        errors[audits_path(100)] = 404  # already waiting when the run stops
+        self.fake = GatedZendesk(pages, errors, {audits_path(t) for t in working})
+        audits, coverage = zendesk.fetch_macro_audits(self.fake, SINCE, self.fake.log, workers=1)
+        self.assertTrue(coverage.stopped_early)
+        self.assertEqual(coverage.skipped, [100])
+        self.assertNotIn(100, coverage.unread)
+        self.assertNotIn(100, [a["ticket_id"] for a in audits])
+
     def test_a_skipped_ticket_resets_the_count(self):
         first, second = list(range(1, self.STREAK)), list(range(200, 200 + self.STREAK - 1))
         errors = {audits_path(t): gave_up() for t in first + second}
@@ -299,6 +365,7 @@ class EarlyStopTests(unittest.TestCase):
         _, coverage = zendesk.fetch_macro_audits(self.fake, SINCE, lambda _: None, workers=1)
         self.assertFalse(coverage.stopped_early)
         self.assertEqual(coverage.read, 1)
+        self.assertEqual(coverage.skipped, [100])
 
 
 class AfterTheTicketsTests(unittest.TestCase):

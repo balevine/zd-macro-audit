@@ -68,9 +68,11 @@ class Coverage:
     unread: list[int] = field(default_factory=list)   # tickets Zendesk kept failing on, or never reached
     stopped_early: bool = False                       # Zendesk stopped answering, so the run gave up
     names_missing: bool = False                       # agent names couldn't be fetched
+    skipped: list[int] = field(default_factory=list)  # tickets deleted or hidden from this sign-in (403 or 404)
 
     @property
     def read(self) -> int:
+        """Tickets Zendesk answered for, skipped ones included."""
         return self.tickets - len(self.unread)
 
 
@@ -439,8 +441,8 @@ def fetch_updated_ticket_ids(zd: Zendesk, since: datetime, log: Callable[[str], 
     return list(ids)
 
 
-def fetch_ticket_macro_audits(zd: Zendesk, ticket_id: int, since: datetime) -> list[dict]:
-    """The audits on one ticket that applied a macro on or after `since`."""
+def fetch_ticket_macro_audits(zd: Zendesk, ticket_id: int, since: datetime) -> list[dict] | None:
+    """The audits on one ticket that applied a macro on or after `since`, or None if the ticket can't be seen."""
     kept = []
     try:
         for audit in zd.paginate(f"/api/v2/tickets/{ticket_id}/audits.json?page%5Bsize%5D=100", "audits"):
@@ -449,14 +451,15 @@ def fetch_ticket_macro_audits(zd: Zendesk, ticket_id: int, since: datetime) -> l
             ):
                 kept.append(_slim_audit(audit))
     except ZendeskError as exc:
-        if exc.status not in (403, 404):  # deleted or hidden since the export ran
-            raise
+        if exc.status in (403, 404):  # deleted or hidden since the export ran
+            return None
+        raise
     return kept
 
 
 def fetch_macro_audits(zd: Zendesk, since: datetime, log: Callable[[str], None],
                        workers: int = 4) -> tuple[list[dict], Coverage]:
-    """Macro audits from every updated ticket, and which tickets couldn't be read.
+    """Macro audits from every updated ticket, and which tickets couldn't be read or were skipped.
 
     Stops early if Zendesk hasn't answered for GIVE_UP_STREAK tickets in a row.
     """
@@ -464,17 +467,25 @@ def fetch_macro_audits(zd: Zendesk, since: datetime, log: Callable[[str], None],
     log(f"Reading the history of {len(ticket_ids):,} tickets...")
     audits: list[dict] = []
     read: set[int] = set()
+    skipped: list[int] = []
     set_aside: list[int] = []
     streak = 0
     stopped = False
     started = time.time()
+
+    def keep(ticket_id: int, found: list[dict] | None) -> None:
+        read.add(ticket_id)
+        if found is None:
+            skipped.append(ticket_id)
+        else:
+            audits.extend(found)
+
     pool = ThreadPoolExecutor(max_workers=workers)
     try:
         futures = {pool.submit(fetch_ticket_macro_audits, zd, tid, since): tid for tid in ticket_ids}
         for done, future in enumerate(as_completed(futures), 1):
             try:
-                audits.extend(future.result())
-                read.add(futures[future])
+                keep(futures[future], future.result())
                 streak = 0
             except ZendeskError as exc:
                 if not exc.gave_up:
@@ -499,19 +510,17 @@ def fetch_macro_audits(zd: Zendesk, since: datetime, log: Callable[[str], None],
         # Keep any ticket that finished while the pool was stopping.
         for future, ticket_id in futures.items():
             if ticket_id not in read and not future.cancelled() and future.exception() is None:
-                audits.extend(future.result())
-                read.add(ticket_id)
+                keep(ticket_id, future.result())
     elif set_aside:
         log(f"Trying {len(set_aside):,} failed ticket{'' if len(set_aside) == 1 else 's'} again...")
         for ticket_id in sorted(set_aside):
             try:
-                audits.extend(fetch_ticket_macro_audits(zd, ticket_id, since))
-                read.add(ticket_id)
+                keep(ticket_id, fetch_ticket_macro_audits(zd, ticket_id, since))
             except ZendeskError as exc:
                 if not exc.gave_up:
                     raise
     unread = sorted(set(ticket_ids) - read)
-    return audits, Coverage(len(ticket_ids), unread, stopped)
+    return audits, Coverage(len(ticket_ids), unread, stopped, skipped=sorted(skipped))
 
 
 def fetch_macros(zd: Zendesk, wanted: Iterable[str], log: Callable[[str], None]) -> dict[str, dict]:

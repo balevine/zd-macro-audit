@@ -275,6 +275,35 @@ class RunTests(TempFolderTest):
         self.assertNotIn("Unread", out)
         self.assertFalse((self.report_folder() / "unread_tickets.csv").exists())
 
+    def test_skipped_tickets_get_a_note(self):
+        self.signed_in(self.fetched([], skipped=[4, 8, 15]))
+        code, out, _ = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertIn("\n\nNote: 3 tickets were skipped because they were deleted or this sign-in can't see "
+                      "them.\n\nReport: ", out)
+        self.assertNotIn("Warning", out)
+
+    def test_one_skipped_ticket(self):
+        self.signed_in(self.fetched([], skipped=[4]))
+        _, out, _ = self.run_main()
+        self.assertIn("\n\nNote: 1 ticket was skipped because it was deleted or this sign-in can't see it.\n\n"
+                      "Report: ", out)
+
+    def test_skipped_note_comes_after_the_unread_tickets(self):
+        self.signed_in(self.fetched([5], skipped=[4, 8], names_missing=True))
+        _, out, _ = self.run_main()
+        self.assertIn(f"  All listed in {self.report_folder() / 'unread_tickets.csv'}\n"
+                      "\nNote: 2 tickets were skipped because they were deleted or this sign-in can't see them.\n"
+                      "\nWarning: Zendesk didn't answer when asked for agent names", out)
+
+    def test_no_note_when_nothing_was_skipped(self):
+        self.signed_in(self.fetched([5]))
+        _, out, _ = self.run_main()
+        self.assertNotIn("Note:", out)
+        self.assertNotIn("skipped", out)
+        _, out, _ = self.run_main("--sample")
+        self.assertNotIn("Note:", out)
+
     def test_no_warning_when_every_ticket_was_read(self):
         self.signed_in(self.fetched([]))
         code, out, _ = self.run_main()
@@ -312,6 +341,16 @@ class RunTests(TempFolderTest):
         self.assertIn("Agent names are missing.", html)
         self.assertIn("<td>User 7<div class='sub'></div></td>", html)
         self.assertIn("Warning: Zendesk didn't answer when asked for agent names", out)
+
+    def test_deleted_ticket_is_noted_from_sign_in_to_report(self):
+        self.fake_account({})  # ticket 3 answers 404
+        code, out, _ = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertIn("\nNote: 1 ticket was skipped because it was deleted or this sign-in can't see it.\n", out)
+        html = (self.report_folder() / "report.html").read_text(encoding="utf-8")
+        self.assertIn('<strong>1 ticket was skipped.</strong>', html)
+        self.assertIn('<div class="ids"><a href="https://acme.zendesk.com/agent/tickets/3" target="_blank" '
+                      'rel="noopener">3</a></div>', html)
 
     def test_macros_that_never_arrive_give_no_report(self):
         self.fake_account({MACRO_PATH + "&include=usage_30d": gave_up()})

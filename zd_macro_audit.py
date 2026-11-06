@@ -124,6 +124,12 @@ def print_summary(result: analyze.Result, paths: dict[str, Path]) -> None:
         more = f", and {len(unread) - MAX_IDS_SHOWN:,} more" if len(unread) > MAX_IDS_SHOWN else ""
         print(f"  Unread {noun}: {shown}{more}")
         print(f"  All listed in {paths['unread']}")
+    if cov.skipped:
+        if len(cov.skipped) == 1:
+            print("\nNote: 1 ticket was skipped because it was deleted or this sign-in can't see it.")
+        else:
+            print(f"\nNote: {len(cov.skipped):,} tickets were skipped because they were deleted or this sign-in "
+                  "can't see them.")
     if cov.names_missing:
         print("\nWarning: Zendesk didn't answer when asked for agent names, so agents are shown by ID.")
     print(f"\nReport: {paths['report']}")
