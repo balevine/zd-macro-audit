@@ -11,6 +11,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from email.message import Message
 from pathlib import Path
 from unittest import mock
@@ -43,6 +44,11 @@ class BrokenReply(io.BytesIO):
 
 
 BACKOFF = [1, 2, 4, 8, 16, 32, 60]  # the waits between 8 tries
+
+
+def refused(where):
+    return (f"Zendesk sent a next-page link to {where} instead of https://acme.zendesk.com, "
+            "so the run stopped rather than send the sign-in there.")
 
 
 def sent_header(request):
@@ -323,8 +329,58 @@ class RequestTests(OAuthTestCase):
         self.assertEqual(request.full_url, "https://acme.zendesk.com/api/v2/x.json")
         self.assertEqual(sent_header(request), "Bearer t")
         self.assertEqual(request.get_header("User-agent"), "zd-macro-audit/1.0")
-        self.get(reply({}), path="https://other.example/next")
-        self.assertEqual(self.urlopen.call_args[0][0].full_url, "https://other.example/next")
+        for url in ("https://acme.zendesk.com/api/v2/x.json?page=2", "https://ACME.zendesk.com:443/api/v2/x.json"):
+            self.get(reply({}), path=url)
+            self.assertEqual(self.urlopen.call_args[0][0].full_url, url)
+
+    def test_links_to_anywhere_else_are_refused_before_sending(self):
+        cases = {
+            "https://evil.com/api/v2/x.json?page=2": "https://evil.com",
+            "http://acme.zendesk.com/api/v2/x.json?page=2": "http://acme.zendesk.com",
+            "https://acme.zendesk.com.evil.com/api/v2/x.json": "https://acme.zendesk.com.evil.com",
+            "https://acme.zendesk.com@evil.com/api/v2/x.json": "https://evil.com",
+            "https://acme.zendesk.com:8443/api/v2/x.json": "https://acme.zendesk.com:8443",
+            "https://acme.zendesk.com:x/api/v2/x.json": "https://acme.zendesk.com:x",
+            "@evil.com/api/v2/x.json": "https://evil.com",  # a path that changes the host once joined
+        }
+        for url, where in cases.items():
+            with self.subTest(url):
+                with self.assertRaises(ZendeskError) as caught:
+                    self.get(reply({}), path=url)
+                self.assertEqual(str(caught.exception), refused(where))
+                self.assertEqual((caught.exception.status, caught.exception.gave_up), (None, False))
+                self.urlopen.assert_not_called()
+
+    def test_pages_stop_at_a_link_to_another_site(self):
+        first = {"audits": [{"id": 1}], "meta": {"has_more": True}, "links": {"next": "https://evil.com/page2"}}
+        with mock.patch("urllib.request.urlopen", side_effect=[reply(first), reply({"audits": [{"id": 2}]})]) as urlopen:
+            pages = self.zd.paginate("/api/v2/tickets/1/audits.json", "audits")
+            self.assertEqual(next(pages), {"id": 1})
+            with self.assertRaises(ZendeskError) as caught:
+                next(pages)
+        self.assertEqual(str(caught.exception), refused("https://evil.com"))
+        self.assertEqual([c[0][0].full_url for c in urlopen.call_args_list],
+                         ["https://acme.zendesk.com/api/v2/tickets/1/audits.json"])
+
+    def test_offset_pages_stop_at_a_link_to_another_site(self):
+        first = {"macros": [{"id": 1}], "next_page": "https://evil.com/page2"}
+        with mock.patch("urllib.request.urlopen", side_effect=[reply(first), reply({"macros": [{"id": 2}]})]) as urlopen:
+            pages = self.zd.paginate("/api/v2/macros.json", "macros")
+            self.assertEqual(next(pages), {"id": 1})
+            with self.assertRaises(ZendeskError) as caught:
+                next(pages)
+        self.assertEqual(str(caught.exception), refused("https://evil.com"))
+        self.assertEqual(urlopen.call_count, 1)
+
+    def test_ticket_export_stops_at_a_link_to_another_site(self):
+        first = {"tickets": [{"id": 1}], "after_url": "https://evil.com/export2", "end_of_stream": False}
+        since = datetime(2026, 10, 1, tzinfo=timezone.utc)
+        with mock.patch("urllib.request.urlopen", side_effect=[reply(first), reply({"tickets": []})]) as urlopen:
+            with self.assertRaises(ZendeskError) as caught:
+                zendesk.fetch_updated_ticket_ids(self.zd, since, lambda _: None)
+        self.assertEqual(str(caught.exception), refused("https://evil.com"))
+        self.assertEqual([c[0][0].full_url for c in urlopen.call_args_list],
+                         [f"https://acme.zendesk.com/api/v2/incremental/tickets/cursor?start_time={int(since.timestamp())}"])
 
     def test_rate_limit_waits_as_long_as_zendesk_asks(self):
         self.assertEqual(self.get(http_error(429, retry_after="7"), reply({"ok": 1})), {"ok": 1})

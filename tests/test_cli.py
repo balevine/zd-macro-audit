@@ -12,6 +12,13 @@ from tests.test_fetch import MACRO_PATH, FakeZendesk, audits_path, base_pages, g
 from zdaudit.zendesk import AuthError, Coverage, ZendeskError
 
 NO_ENV = {env: "" for env in zd_macro_audit.ENV_VARS.values()}
+BAD_SUBDOMAINS = ("evil.com#", "evil.com?", "acme corp", "acme.", "acme.zendesk.com.", "-acme", "a_b",
+                  "acme.evil.com", "https://")
+
+
+def bad_subdomain(value):
+    return (f'Zendesk subdomain "{value}" isn\'t valid. Use just the "acme" part of acme.zendesk.com '
+            "(letters, numbers and hyphens).")
 
 
 class TempFolderTest(unittest.TestCase):
@@ -30,6 +37,19 @@ class SubdomainTests(unittest.TestCase):
         for value in ("acme", " ACME ", "acme.zendesk.com", "https://acme.zendesk.com/agent/tickets/1",
                       "http://acme.zendesk.com"):
             self.assertEqual(zd_macro_audit.clean_subdomain(value), "acme", value)
+
+    def test_hyphens_and_numbers_are_kept(self):
+        self.assertEqual(zd_macro_audit.clean_subdomain("https://Acme-2.zendesk.com/agent"), "acme-2")
+
+    def test_blank_stays_blank_so_the_run_asks(self):
+        self.assertEqual(zd_macro_audit.clean_subdomain("  "), "")
+
+    def test_anything_else_stops_the_run(self):
+        for value in BAD_SUBDOMAINS:
+            with self.subTest(value):
+                with self.assertRaises(SystemExit) as caught:
+                    zd_macro_audit.clean_subdomain(f" {value} ")
+                self.assertEqual(caught.exception.code, bad_subdomain(value))
 
 
 class ConfigTests(TempFolderTest):
@@ -87,6 +107,44 @@ class ConfigTests(TempFolderTest):
         self.path.write_text(json.dumps({"subdomain": "old", "client_id": "c"}))
         with mock.patch.dict(os.environ, {"ZENDESK_SUBDOMAIN": "https://new.zendesk.com"}):
             self.assertEqual(self.load()["subdomain"], "new")
+
+    def test_bad_subdomain_in_the_file_stops_the_run(self):
+        for value in BAD_SUBDOMAINS:
+            with self.subTest(value):
+                original = json.dumps({"subdomain": value, "client_id": "c"})
+                self.path.write_text(original)
+                with self.assertRaises(SystemExit) as caught:
+                    self.load()
+                self.assertEqual(caught.exception.code, bad_subdomain(value))
+                self.assertEqual(self.path.read_text(), original)
+
+    def test_bad_subdomain_in_the_environment_stops_the_run(self):
+        self.path.write_text(json.dumps({"subdomain": "acme", "client_id": "c"}))
+        for value in BAD_SUBDOMAINS:
+            with self.subTest(value):
+                with mock.patch.dict(os.environ, {"ZENDESK_SUBDOMAIN": value}), \
+                        self.assertRaises(SystemExit) as caught:
+                    self.load()
+                self.assertEqual(caught.exception.code, bad_subdomain(value))
+
+    def test_bad_subdomain_typed_at_the_prompt_stops_the_run_and_is_not_saved(self):
+        original = json.dumps({"client_id": "c"})
+        for value in BAD_SUBDOMAINS:
+            with self.subTest(value):
+                self.path.write_text(original)
+                with mock.patch("builtins.input", side_effect=[value, "acme"]) as typed, \
+                        mock.patch("builtins.print"), self.assertRaises(SystemExit) as caught:
+                    zd_macro_audit.load_config(self.path)
+                self.assertEqual(caught.exception.code, bad_subdomain(value))
+                self.assertEqual(typed.call_count, 1)
+                self.assertEqual(self.path.read_text(), original)
+
+    def test_bad_subdomain_on_a_first_run_writes_no_file(self):
+        with mock.patch("builtins.input", side_effect=["evil.com#"]), mock.patch("builtins.print"), \
+                self.assertRaises(SystemExit) as caught:
+            zd_macro_audit.load_config(self.path)
+        self.assertEqual(caught.exception.code, bad_subdomain("evil.com#"))
+        self.assertFalse(self.path.exists())
 
     def test_blank_answers_stop_the_run(self):
         with self.assertRaisesRegex(SystemExit, "Missing settings: client_id"):
@@ -276,6 +334,30 @@ class RunTests(TempFolderTest):
         code, out, _ = self.run_main()
         self.assertEqual(code, 0)
         self.assertIn("  Unread ticket: 2\n", out)
+
+    def test_link_to_another_site_stops_the_run_without_a_traceback(self):
+        """A real client, so the check in Zendesk.get is what stops it."""
+        self.path.write_text(json.dumps({"subdomain": "acme", "email": "a@acme.com", "api_token": "t"}))
+        sent = []
+
+        def urlopen(request, timeout=None):
+            sent.append(request.full_url)
+            if request.full_url.endswith("/users/me.json"):
+                return io.BytesIO(json.dumps({"user": {"id": 1, "role": "admin"}}).encode())
+            if request.full_url.startswith("https://evil.com/"):
+                return io.BytesIO(json.dumps({"tickets": [], "end_of_stream": True}).encode())
+            return io.BytesIO(json.dumps({"tickets": [{"id": 1}], "end_of_stream": False,
+                                          "after_url": "https://evil.com/api/v2/incremental/tickets/cursor"}).encode())
+
+        with mock.patch("urllib.request.urlopen", urlopen):
+            code, _, err = self.run_main()
+        self.assertEqual(code, 1)
+        self.assertEqual(err, "\nError: Zendesk sent a next-page link to https://evil.com instead of "
+                              "https://acme.zendesk.com, so the run stopped rather than send the sign-in there.\n")
+        self.assertEqual([url.split("?")[0] for url in sent],
+                         ["https://acme.zendesk.com/api/v2/users/me.json",
+                          "https://acme.zendesk.com/api/v2/incremental/tickets/cursor"])
+        self.assertFalse((self.dir / "reports").exists())
 
     def test_sign_in_error_is_reported(self):
         self.signed_in(error=AuthError("nope"))

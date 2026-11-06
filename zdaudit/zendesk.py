@@ -353,8 +353,23 @@ class Zendesk:
             host = urllib.parse.urlparse(url).hostname
             raise ZendeskError(f"Couldn't find {host}. Check the Zendesk subdomain.") from exc
 
+    def _check_link(self, url: str) -> None:
+        """Refuse any URL that isn't https on this Zendesk account, so the sign-in is never sent elsewhere."""
+        parts = urllib.parse.urlsplit(url)
+        try:
+            port = parts.port
+        except ValueError:  # not a number
+            port = -1
+        if parts.scheme == "https" and parts.hostname == urllib.parse.urlsplit(self.base).hostname \
+                and port in (None, 443):
+            return
+        where = f"{parts.scheme}://{parts.netloc.rpartition('@')[2]}"
+        raise ZendeskError(f"Zendesk sent a next-page link to {where} instead of {self.base}, so the run "
+                           "stopped rather than send the sign-in there.")
+
     def get(self, path_or_url: str) -> dict:
         url = path_or_url if path_or_url.startswith("http") else self.base + path_or_url
+        self._check_link(url)
         refreshed = False
         used_token = ""
 
@@ -534,6 +549,8 @@ def fetch_dynamic_content(zd: Zendesk, log: Callable[[str], None]) -> dict[str, 
             if key and variants:
                 items[key] = [v["content"] for v in variants]
     except ZendeskError as exc:
+        if exc.status is None and not exc.gave_up:  # retrying won't fix it, like a link to another site
+            raise
         reason = exc.status or "Zendesk didn't answer"
         log(f"  Couldn't read dynamic content ({reason}). {{{{dc.*}}}} placeholders will match any text.")
     return items

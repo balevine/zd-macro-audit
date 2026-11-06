@@ -25,9 +25,17 @@ MAX_IDS_SHOWN = 20  # ticket IDs listed in the terminal summary
 
 
 def clean_subdomain(value: str) -> str:
-    """Accept 'acme', 'acme.zendesk.com' or 'https://acme.zendesk.com/agent'."""
-    value = re.sub(r"^https?://", "", value.strip().lower()).split("/")[0]
-    return re.sub(r"\.zendesk\.com$", "", value)
+    """Accept 'acme', 'acme.zendesk.com' or 'https://acme.zendesk.com/agent'.
+
+    Stops the run if what's left can't be a subdomain, since it becomes the host the sign-in is sent to.
+    """
+    given = value.strip()
+    value = re.sub(r"^https?://", "", given.lower()).split("/")[0]
+    value = re.sub(r"\.zendesk\.com$", "", value)
+    if given and not re.fullmatch(r"[a-z0-9][a-z0-9-]*", value):
+        sys.exit(f'Zendesk subdomain "{given}" isn\'t valid. Use just the "acme" part of acme.zendesk.com '
+                 "(letters, numbers and hyphens).")
+    return value
 
 
 ENV_VARS = {"subdomain": "ZENDESK_SUBDOMAIN", "client_id": "ZENDESK_CLIENT_ID",
@@ -43,6 +51,7 @@ def load_config(path: Path, auth: str | None = None) -> dict:
     """
     saved = json.loads(path.read_text()) if path.exists() else {}
     config = {key: os.environ.get(env) or saved.get(key, "") for key, env in ENV_VARS.items()}
+    config["subdomain"] = clean_subdomain(config["subdomain"])
     asked = False
 
     def ask(key: str, prompt: str, hidden: bool = False) -> None:
@@ -78,7 +87,6 @@ def load_config(path: Path, auth: str | None = None) -> dict:
 
     if not all(config[key] for key in required):
         sys.exit("Missing settings: " + ", ".join(k for k in required if not config[k]))
-    config["subdomain"] = clean_subdomain(config["subdomain"])
     if asked:
         path.write_text(json.dumps(saved, indent=2) + "\n")
         os.chmod(path, 0o600)

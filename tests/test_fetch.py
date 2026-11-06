@@ -424,6 +424,16 @@ class DynamicContentTests(unittest.TestCase):
         self.assertEqual(zendesk.fetch_dynamic_content(fake, messages.append), {})
         self.assertIn("403", messages[0])
 
+    def test_link_to_another_site_stops_the_run(self):
+        messages = []
+        refused = zendesk.ZendeskError("Zendesk sent a next-page link to https://evil.com instead of "
+                                       "https://acme.zendesk.com, so the run stopped rather than send the sign-in there.")
+        fake = FakeZendesk({}, {self.PATH: refused})
+        with self.assertRaises(zendesk.ZendeskError) as caught:
+            zendesk.fetch_dynamic_content(fake, messages.append)
+        self.assertIs(caught.exception, refused)
+        self.assertEqual(messages, [])
+
     def test_only_fetched_when_a_macro_uses_it(self):
         pages = base_pages()
         errors = {audits_path(3): 404, "/api/v2/macros/56.json": 404}
