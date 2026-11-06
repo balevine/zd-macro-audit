@@ -8,7 +8,8 @@ from pathlib import Path
 
 from tests.helpers import UNTIL, fields_only_macro, make_audit, run_audit, run_audits, use_macro
 from zdaudit.zendesk import Coverage
-from zdaudit.report import _bar, _fmt_macro_pct, _render_diff, fmt_pct, render_html, ticket_url, write_all
+from zdaudit.report import (_bar, _fmt_macro_pct, _render_diff, fmt_pct, render_html, shown_comment_types,
+                            ticket_url, tip, write_all)
 
 
 def page_data(html):
@@ -253,6 +254,39 @@ class PageTests(unittest.TestCase):
         self.assertNotIn('>Macro<', panel)
         every_use = html.split('<table id="uses">')[1].split("</thead>")[0]
         self.assertIn('>Macro<', every_use)
+
+
+class TileTests(unittest.TestCase):
+    def test_one_of_everything_is_singular(self):
+        html = render_html(run_audits([use_macro(1, "Fixed text.")], macro_uses(1, edited=0, intact=1)), "acme")
+        self.assertIn(f'<div class="tv">1</div><div class="tl">{tip("macro use", "uses")}</div>', html)
+        self.assertIn('<div class="ts">1 macro</div>', html)
+        self.assertIn(f'<div class="ts">0 of 1 {tip("compared use", "compared_sub")}</div>', html)
+        self.assertIn(f'<div class="ts">1 of 1 {tip("compared use", "compared_sub")}, 0 with text added</div>', html)
+        self.assertIn('<div class="ts">0 of 1 agent edited at least once</div>', html)
+
+    def test_several_are_plural(self):
+        macros = [use_macro(1, "Fixed text."), use_macro(2, "Other fixed text.")]
+        audits = [make_audit([1], "Changed words.", audit_id=1, agent=7),
+                  make_audit([2], "Other fixed text.", audit_id=2, agent=8)]
+        html = render_html(run_audits(macros, audits), "acme")
+        self.assertIn(f'<div class="tv">2</div><div class="tl">{tip("macro uses", "uses")}</div>', html)
+        self.assertIn('<div class="ts">2 different macros</div>', html)
+        self.assertIn(f'<div class="ts">1 of 2 {tip("compared uses", "compared_sub")}</div>', html)
+        self.assertIn(f'<div class="ts">1 of 2 {tip("compared uses", "compared_sub")}, 0 with text added</div>', html)
+        self.assertIn('<div class="ts">1 of 2 agents edited at least once</div>', html)
+
+
+class ShownCommentTypesTests(unittest.TestCase):
+    def by_type(self, none_compared):
+        tally = lambda n: {"compared": n, "edited": 0, "unedited": n, "pct_uses_edited": None if n == 0 else 0.0}
+        return {"public": tally(0), "internal": tally(0), "none": tally(none_compared)}
+
+    def test_no_comment_is_hidden_until_some_were_compared(self):
+        self.assertEqual(shown_comment_types(self.by_type(0)), ["public", "internal"])
+
+    def test_no_comment_is_shown_once_some_were_compared(self):
+        self.assertEqual(shown_comment_types(self.by_type(1)), ["public", "internal", "none"])
 
 
 class SkippedNoteTests(unittest.TestCase):

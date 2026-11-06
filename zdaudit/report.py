@@ -264,16 +264,21 @@ def _tiles(o: dict) -> str:
     if o["avg_pct_of_macro_when_edited"] is not None:
         average = _fmt_macro_pct(o["avg_pct_of_macro_when_edited"]).replace("<", "under ")
         edit_note = f'<span class="muted">{tip(f"Edited uses changed {average} of the macro on average", "macro_edit_avg")}</span>'
+    # "1 different macro" reads oddly, so a single macro is just "1 macro".
+    macros = "1 macro" if o["macros_used"] == 1 else f"{o['macros_used']:,} different macros"
+    uses = tip("macro use" if o["uses"] == 1 else "macro uses", "uses")
+    compared = tip("compared use" if o["compared"] == 1 else "compared uses", "compared_sub")
+    agents = "agent" if o["agents_using"] == 1 else "agents"
     return f"""
     <div class="tiles">
-      <div class="tile"><div class="tv">{o['uses']:,}</div><div class="tl">{tip("macro uses", "uses")}</div>
-        <div class="ts">{o['macros_used']:,} different macros</div></div>
+      <div class="tile"><div class="tv">{o['uses']:,}</div><div class="tl">{uses}</div>
+        <div class="ts">{macros}</div></div>
       <div class="tile"><div class="tv edited">{fmt_pct(o['pct_uses_edited'])}</div><div class="tl">{tip("sent edited", "sent_edited")}</div>
-        <div class="ts">{o['edited']:,} of {o['compared']:,} {tip("compared uses", "compared_sub")}</div></div>
+        <div class="ts">{o['edited']:,} of {o['compared']:,} {compared}</div></div>
       <div class="tile"><div class="tv unedited">{fmt_pct(o['pct_uses_intact'])}</div><div class="tl">{tip("kept intact", "kept_intact")}</div>
-        <div class="ts">{o['unedited']:,} of {o['compared']:,} {tip("compared uses", "compared_sub")}, {o['added_text']:,} with text added</div></div>
+        <div class="ts">{o['unedited']:,} of {o['compared']:,} {compared}, {o['added_text']:,} with text added</div></div>
       <div class="tile"><div class="tv">{fmt_pct(o['pct_agents_editing'])}</div><div class="tl">{tip("of agents edit macros", "agents_editing")}</div>
-        <div class="ts">{o['agents_editing']:,} of {o['agents_using']:,} agents edited at least once</div></div>
+        <div class="ts">{o['agents_editing']:,} of {o['agents_using']:,} {agents} edited at least once</div></div>
     </div>
     <div class="split" role="img" aria-label="{fmt_pct(o['pct_uses_edited'])} edited, {fmt_pct(o['pct_uses_intact'])} kept intact">
       <span class="s-edited" style="width:{edited_w}%"></span><span class="s-unedited" style="width:{100 - edited_w if o['compared'] else 0}%"></span>
@@ -283,14 +288,23 @@ def _tiles(o: dict) -> str:
     """
 
 
+def shown_comment_types(by_type: dict) -> list[str]:
+    """The comment types the report and the printed summary list, in order.
+
+    Uses with no comment only get a row once some of them were compared, since they're rare.
+    """
+    return [kind for kind in ("public", "internal", "none") if by_type[kind]["compared"] or kind != "none"]
+
+
+TYPE_ROWS = {"public": ("Public replies", "public_row"), "internal": ("Internal notes", "internal_row"),
+             "none": ("No comment (macro text deleted)", "none_row")}
+
+
 def _type_rows(by_type: dict) -> str:
     return "".join(
         f"<tr><td>{tip(label, key)}</td><td class='r'>{t['compared']:,}</td><td class='r'>{t['edited']:,}</td>"
         f"<td class='r'>{t['unedited']:,}</td><td>{_bar(t['pct_uses_edited'])}</td></tr>"
-        for label, key, t in (("Public replies", "public_row", by_type["public"]),
-                              ("Internal notes", "internal_row", by_type["internal"]),
-                              ("No comment (macro text deleted)", "none_row", by_type["none"]))
-        if t["compared"] or key != "none_row"
+        for (label, key), t in ((TYPE_ROWS[kind], by_type[kind]) for kind in shown_comment_types(by_type))
     )
 
 
@@ -310,7 +324,7 @@ def _ticket_links(ticket_ids: list[int], subdomain: str | None) -> str:
     )
 
 
-def _warnings(result: Result, subdomain: str | None) -> str:
+def _warnings(result: Result, subdomain: str | None, has_usage: bool) -> str:
     """Boxes at the top of the page for anything the run couldn't read."""
     cov = result.coverage
     boxes = []
@@ -336,7 +350,7 @@ def _warnings(result: Result, subdomain: str | None) -> str:
         one = len(cov.skipped) == 1
         noun, verb, it, its = ("ticket", "was", "it", "it's") if one else ("tickets", "were", "them", "they're")
         gap = ""
-        if any(m["zendesk_usage_30d"] is not None for m in result.macros):
+        if has_usage:
             gap = ', which can explain why this report finds fewer uses than the "Zendesk count" column'
         boxes.append(f'<div class="notice" role="note"><strong>{len(cov.skipped):,} {noun} {verb} skipped.</strong> '
                      f"{'It was' if one else 'They were'} deleted, or this sign-in isn't allowed to see {it} "
@@ -346,8 +360,8 @@ def _warnings(result: Result, subdomain: str | None) -> str:
     return "\n  ".join(boxes)
 
 
-def _usage_note(result: Result) -> str:
-    if not any(m["zendesk_usage_30d"] is not None for m in result.macros):
+def _usage_note(result: Result, has_usage: bool) -> str:
+    if not has_usage:
         return ""
     note = (" \"Zendesk count\" is Zendesk's own tally of uses in the last 30 days. It should be "
             "close to Uses. A big gap means some uses were missed.")
@@ -458,7 +472,7 @@ def render_html(result: Result, subdomain: str | None) -> str:
   <h1>Macro edit report</h1>
   <div class="meta">{escape(account)} · {period} · generated {escape(generated)}
     <div class="sub">Point to any underlined label to see what it means.</div></div>
-  {_warnings(result, subdomain)}
+  {_warnings(result, subdomain, has_usage)}
   {_tiles(o)}
 
   <h2>Which macros get edited</h2>
@@ -475,7 +489,7 @@ def render_html(result: Result, subdomain: str | None) -> str:
   </table></div>
 
   <h2>Macros</h2>
-  <p class="muted">Every macro used in this period, most used first. Click a macro to see each of its uses, with how much of the macro was edited and a link to the ticket.{_usage_note(result)}</p>
+  <p class="muted">Every macro used in this period, most used first. Click a macro to see each of its uses, with how much of the macro was edited and a link to the ticket.{_usage_note(result, has_usage)}</p>
   <div class="tablewrap"><table id="macros">
     <thead><tr>{sort_th("Macro", "macro", "title", False)}{sort_th("Uses", "macro_uses", "uses")}{usage_th}{sort_th("Compared", "macro_compared", "compared")}{sort_th("Edited", "macro_edited", "edited")}{sort_th("% of uses edited", "macro_pct", "pct", False)}
       {sort_th("Avg % of macro edited", "avg_all", "avg")}{sort_th("Avg when edited", "avg_edited", "avgedited")}{th("Public", "public", True)}{th("Internal", "internal", True)}</tr></thead>

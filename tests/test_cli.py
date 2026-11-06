@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 import zd_macro_audit
+from tests.helpers import make_audit, use_macro
 from tests.test_auth import mode, modes_while_writing
 from tests.test_fetch import MACRO_PATH, FakeZendesk, audits_path, base_pages, gave_up
 from zdaudit.zendesk import AuthError, Coverage, ZendeskError
@@ -225,6 +226,19 @@ class RunTests(TempFolderTest):
             with mock.patch.object(zd_macro_audit, "load_config", wraps=zd_macro_audit.load_config) as load:
                 self.run_main(flag)
             self.assertEqual(load.call_args[0][1], auth)
+
+    def test_macro_count_is_singular_for_one(self):
+        macros = {"1": use_macro(1, "Fixed text.")}
+        self.signed_in({"audits": [make_audit([1], "Fixed text.")], "macros": macros, "users": {}, "dynamic": {}})
+        _, out, _ = self.run_main()
+        self.assertIn("\nMacro uses found:     1 (1 macro)\n", out)
+
+    def test_macro_count_is_plural_for_several(self):
+        macros = {"1": use_macro(1, "Fixed text."), "2": use_macro(2, "Other text.")}
+        audits = [make_audit([1], "Fixed text.", audit_id=1), make_audit([2], "Other text.", audit_id=2)]
+        self.signed_in({"audits": audits, "macros": macros, "users": {}, "dynamic": {}})
+        _, out, _ = self.run_main()
+        self.assertIn("\nMacro uses found:     2 (2 macros)\n", out)
 
     def fetched(self, unread, tickets=100, **coverage):
         return {"audits": [], "macros": {}, "users": {}, "dynamic": {},

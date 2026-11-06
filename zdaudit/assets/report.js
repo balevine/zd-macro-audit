@@ -66,6 +66,9 @@
     if (order === 'old') return list.slice().reverse();
     return list;  // the data is newest first
   }
+  function usesOf(shown, all) {
+    return shown.toLocaleString() + ' of ' + all.toLocaleString() + (all === 1 ? ' use' : ' uses');
+  }
   // Draw a list one page at a time into a table body, with a "Show more" button.
   function pager(body, more, showMacro) {
     var items = [], shown = 0;
@@ -97,7 +100,7 @@
       return (!st.value || u.status === st.value) && (!ty.value || u.type === ty.value) &&
              (!term || searchable[i].indexOf(term) !== -1);
     });
-    count.textContent = list.length.toLocaleString() + ' of ' + uses.length.toLocaleString() + ' uses';
+    count.textContent = usesOf(list.length, uses.length);
     showAll(ordered(list, order.value));
   }
   [q, st, ty, order].forEach(function (el) { el.addEventListener('input', apply); });
@@ -118,7 +121,7 @@
     var show = pager(detail.querySelector('tbody'), detail.querySelector('.more'), false);
     function refresh() {
       var list = edited.checked ? own.filter(function (u) { return u.status === 'edited'; }) : own;
-      summary.textContent = list.length.toLocaleString() + ' of ' + own.length.toLocaleString() + ' uses';
+      summary.textContent = usesOf(list.length, own.length);
       show(ordered(list, select.value));
     }
     select.addEventListener('input', refresh);
