@@ -191,11 +191,19 @@ def _bar(value: float | None) -> str:
 
 
 def _render_diff(ops: list[tuple[str, list[str]]], context: int = 8) -> str:
-    """Show the changes with long unchanged stretches shortened.
+    """Show the changes with long stretches shortened.
+
+    A stretch longer than 2 * context + 3 words keeps context words at each
+    end. Unchanged text gets a plain "…" between them. Removed or added text
+    gets "… N more words" inside the colouring, so it still reads as removed or
+    added. N is always 4 or more there, so the wording is always plural.
 
     A placeholder replaced by the same number of words is Zendesk filling it
     in, not an edit, so those words are shown in a neutral style.
     """
+    def show(words: list[str]) -> str:
+        return " ".join(f'<span class="ph">{escape(w)}</span>' if is_placeholder(w) else escape(w) for w in words)
+
     parts = []
     last = len(ops) - 1
     filled = set()
@@ -220,10 +228,12 @@ def _render_diff(ops: list[tuple[str, list[str]]], context: int = 8) -> str:
             parts.append(f"<span>{text}</span>")
         else:
             tag = "del" if op == "delete" else "ins"
-            rendered = " ".join(
-                f'<span class="ph">{escape(w)}</span>' if is_placeholder(w) else escape(w)
-                for w in words
-            )
+            if len(words) > 2 * context + 3:
+                hidden = len(words) - 2 * context
+                rendered = (show(words[:context]) + f' <span class="gap">… {hidden} more words</span> '
+                            + show(words[-context:]))
+            else:
+                rendered = show(words)
             parts.append(f"<{tag}>{rendered}</{tag}>")
     return " ".join(parts)
 

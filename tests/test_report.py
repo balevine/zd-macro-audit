@@ -84,6 +84,26 @@ class DiffTests(unittest.TestCase):
         self.assertEqual(_render_diff([("equal", words)], context=2), f'<span>{" ".join(words)}</span>')
         self.assertIn("gap", _render_diff([("equal", self.words(8))], context=2))
 
+    def test_long_insert_is_shortened_with_a_count(self):
+        html = _render_diff([("equal", ["a"]), ("insert", self.words(20))], context=2)
+        self.assertEqual(html, '<span>a</span> <ins>w0 w1 <span class="gap">… 16 more words</span> w18 w19</ins>')
+
+    def test_long_delete_is_shortened_with_a_count(self):
+        html = _render_diff([("delete", self.words(11)), ("equal", ["a"])], context=3)
+        self.assertEqual(html, '<del>w0 w1 w2 <span class="gap">… 5 more words</span> w8 w9 w10</del> <span>a</span>')
+
+    def test_change_is_shortened_only_past_the_limit(self):
+        words = self.words(7)  # 2 * context + 3
+        self.assertEqual(_render_diff([("insert", words)], context=2), '<ins>w0 w1 w2 w3 w4 w5 w6</ins>')
+        self.assertEqual(_render_diff([("insert", self.words(8))], context=2),
+                         '<ins>w0 w1 <span class="gap">… 4 more words</span> w6 w7</ins>')
+
+    def test_placeholder_kept_in_a_shortened_delete_is_marked(self):
+        words = ["{{name}}"] + self.words(9)
+        html = _render_diff([("delete", words)], context=2)
+        self.assertEqual(html, '<del><span class="ph">{{name}}</span> w0 <span class="gap">… 6 more words</span> '
+                               'w7 w8</del>')
+
 
 class PageDataTests(unittest.TestCase):
     def test_a_use_has_what_the_tables_need(self):

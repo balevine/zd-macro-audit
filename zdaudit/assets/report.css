@@ -66,6 +66,7 @@ del { background:var(--del-bg); color:var(--del); text-decoration:line-through; 
 ins { background:var(--ins-bg); color:var(--ins); text-decoration:none; border-radius:3px; padding:0 2px; }
 .ph { font-family:ui-monospace, Menlo, monospace; font-size:12px; opacity:0.75; }
 .gap { color:var(--muted); }
+del .gap { display:inline-block; text-decoration:none; } /* a crossed-out count would read as removed text */
 .fill, .tip { border-bottom:1px dotted var(--muted); cursor:help; }
 .tip:focus-visible { outline:2px solid var(--accent); outline-offset:2px; border-radius:2px; }
 #tip { position:fixed; z-index:10; display:none; max-width:300px; padding:8px 11px; border-radius:8px;
