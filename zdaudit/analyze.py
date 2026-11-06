@@ -88,6 +88,9 @@ def analyze(audits: list[dict], macros: dict[str, dict], users: dict[str, dict],
 
     for audit in sorted(audits, key=lambda a: a["created_at"]):
         created = parse_time(audit["created_at"])
+        # Only the report's period counts. Audits saved while the run was fetching fall after it.
+        if not since <= created <= until:
+            continue
         refs = [e for e in audit["events"] if is_macro_event(e)]
         # A macro referenced twice in one audit is still one use.
         ref_ids = list(dict.fromkeys(str(e["macro_id"]) for e in refs))

@@ -139,6 +139,20 @@ class SeveralMacrosTests(unittest.TestCase):
                          [("1", ["Macro 2"]), ("2", ["Macro 1"])])
 
 
+class PeriodTests(unittest.TestCase):
+    def test_only_audits_inside_the_period_count(self):
+        # SINCE is 2026-09-30 and UNTIL is 2026-10-30, both at midnight.
+        audits = [
+            make_audit([1], "First part.", audit_id=1, created="2026-09-29T23:59:59Z"),
+            make_audit([1], "First part.", audit_id=2, created="2026-09-30T00:00:00Z"),
+            make_audit([1], "First part.", audit_id=3, created="2026-10-30T00:00:00Z"),
+            make_audit([1], "First part.", audit_id=4, created="2026-10-30T00:00:01Z"),
+        ]
+        result = run_audits([use_macro(1, "First part.")], audits)
+        self.assertEqual([u.audit_id for u in result.uses], [2, 3])
+        self.assertEqual(result.overall["uses"], 2)
+
+
 class TotalsTests(unittest.TestCase):
     """One small data set with every kind of use, checked number by number."""
 
