@@ -89,7 +89,8 @@ def analyze(audits: list[dict], macros: dict[str, dict], users: dict[str, dict],
     for audit in sorted(audits, key=lambda a: a["created_at"]):
         created = parse_time(audit["created_at"])
         refs = [e for e in audit["events"] if is_macro_event(e)]
-        ref_ids = [str(e["macro_id"]) for e in refs]
+        # A macro referenced twice in one audit is still one use.
+        ref_ids = list(dict.fromkeys(str(e["macro_id"]) for e in refs))
         comment = next((e for e in audit["events"] if e["type"] == "Comment"), None)
         comment_type = "" if comment is None else ("public" if comment.get("public") else "internal")
         titles = {
@@ -98,8 +99,8 @@ def analyze(audits: list[dict], macros: dict[str, dict], users: dict[str, dict],
             for e in refs
         }
 
-        # Each macro gets its own result. A macro applied twice is compared once.
-        to_compare = [mid for mid in dict.fromkeys(ref_ids) if mid in compiled and compiled[mid].comparable]
+        # Each macro gets its own result.
+        to_compare = [mid for mid in ref_ids if mid in compiled and compiled[mid].comparable]
         comparison = results = None
         if comment is not None and to_compare:
             comparison = compare([compiled[mid] for mid in to_compare], comment.get("body") or "")

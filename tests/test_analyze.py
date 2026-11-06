@@ -125,10 +125,18 @@ class SeveralMacrosTests(unittest.TestCase):
         self.assertEqual([u.status for u in result.uses], ["unedited", "unavailable"])
         self.assertFalse(result.uses[0].added_text)
 
-    def test_macro_applied_twice_needs_one_copy(self):
+    def test_macro_referenced_twice_is_one_use(self):
         result = run_audit([use_macro(1, "First part.")], [1, 1], "First part.")
-        self.assertEqual([u.status for u in result.uses], ["unedited", "unedited"])
-        self.assertEqual(result.overall["uses"], 2)
+        self.assertEqual([(u.macro_id, u.status) for u in result.uses], [("1", "unedited")])
+        self.assertEqual((result.overall["uses"], result.overall["compared"]), (1, 1))
+        self.assertEqual([(m["macro_id"], m["uses"]) for m in result.macros], [("1", 1)])
+        self.assertEqual([a["uses"] for a in result.agents], [1])
+
+    def test_repeated_macro_is_named_once_in_combined_with(self):
+        result = run_audit([use_macro(1, "First part."), use_macro(2, "Second part.")], [1, 1, 2],
+                           "First part. Second part.")
+        self.assertEqual([(u.macro_id, u.combined_with) for u in result.uses],
+                         [("1", ["Macro 2"]), ("2", ["Macro 1"])])
 
 
 class TotalsTests(unittest.TestCase):
