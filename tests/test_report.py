@@ -80,6 +80,11 @@ class DiffTests(unittest.TestCase):
         last = _render_diff([("insert", ["y"]), ("equal", words)], context=2)
         self.assertEqual(last, '<ins>y</ins> <span>w0 w1 <span class="gap">…</span> </span>')
 
+    def test_a_long_stretch_that_is_the_whole_diff_keeps_both_ends(self):
+        # An edit the word diff can't show, like another macro's text inserted inside this one.
+        html = _render_diff([("equal", self.words(20))], context=2)
+        self.assertEqual(html, '<span>w0 w1 <span class="gap">…</span> w18 w19</span>')
+
     def test_short_unchanged_text_is_kept(self):
         words = self.words(7)  # 2 * context + 3
         self.assertEqual(_render_diff([("equal", words)], context=2), f'<span>{" ".join(words)}</span>')

@@ -222,8 +222,9 @@ def _render_diff(ops: list[tuple[str, list[str]]], context: int = 8) -> str:
             continue
         if op == "equal":
             if len(words) > 2 * context + 3:
-                head = words[:context] if i > 0 else []
-                tail = words[-context:] if i < last else []
+                # A stretch that is the whole diff keeps both ends, so it never shrinks to a bare "…".
+                head = words[:context] if i > 0 or last == 0 else []
+                tail = words[-context:] if i < last or last == 0 else []
                 text = escape(" ".join(head)) + ' <span class="gap">…</span> ' + escape(" ".join(tail))
             else:
                 text = escape(" ".join(words))
