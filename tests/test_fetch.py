@@ -147,6 +147,19 @@ class FetchTests(unittest.TestCase):
         self.assertIn("Reading the history of 3 tickets...", messages)
         self.assertTrue(any(m.startswith("  3 of 3 tickets read. 3 macro uses so far.") for m in messages))
 
+    def test_progress_counts_each_macro_in_an_update(self):
+        both = audit(30, 1, 2, "MacroReference")
+        both["events"] += [{"type": "AgentMacroReference", "macro_id": 56},
+                           {"type": "MacroReference", "macro_id": 55}]  # 55 again is still one use
+        for audits, expected in (([both], "2 macro uses"), ([audit(31, 1, 2, "MacroReference")], "1 macro use")):
+            with self.subTest(expected):
+                messages = []
+                fake = FakeZendesk({**base_pages(), audits_path(1): {"audits": audits, "meta": {"has_more": False}},
+                                    audits_path(2): {"audits": [], "meta": {"has_more": False}},
+                                    audits_path(3): {"audits": [], "meta": {"has_more": False}}})
+                zendesk.fetch_macro_audits(fake, SINCE, messages.append, workers=1)
+                self.assertIn(f"  3 of 3 tickets read. {expected} so far. About 0 min left.", messages)
+
 
 class UnreadTicketTests(unittest.TestCase):
     """Tickets Zendesk keeps failing on are tried again at the end, then listed instead of stopping the run."""

@@ -477,16 +477,20 @@ def fetch_macro_audits(zd: Zendesk, since: datetime, log: Callable[[str], None],
     read: set[int] = set()
     skipped: list[int] = []
     set_aside: list[int] = []
+    uses = 0  # macros applied, which can be more than one per audit
     streak = 0
     stopped = False
     started = time.time()
 
     def keep(ticket_id: int, found: list[dict] | None) -> None:
+        nonlocal uses
         read.add(ticket_id)
         if found is None:
             skipped.append(ticket_id)
         else:
             audits.extend(found)
+            # Counted as the analysis does: a macro referenced twice in one audit is one use.
+            uses += sum(len({e["macro_id"] for e in a["events"] if is_macro_event(e)}) for a in found)
 
     pool = ThreadPoolExecutor(max_workers=workers)
     try:
@@ -505,7 +509,7 @@ def fetch_macro_audits(zd: Zendesk, since: datetime, log: Callable[[str], None],
                     break
             if done % 250 == 0 or done == len(futures):
                 left = (time.time() - started) / done * (len(futures) - done) / 60
-                log(f"  {done:,} of {len(futures):,} tickets read. {len(audits):,} macro uses so far. "
+                log(f"  {done:,} of {len(futures):,} tickets read. {uses:,} macro {'use' if uses == 1 else 'uses'} so far. "
                     f"About {left:.0f} min left.")
         if stopped:
             log(f"Zendesk hasn't answered for the last {GIVE_UP_STREAK} tickets, so the tool is stopping early.")
