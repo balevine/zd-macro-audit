@@ -112,8 +112,16 @@ class SeveralMacrosTests(unittest.TestCase):
         one, two = result.uses
         self.assertEqual((one.status, one.pct_of_macro, one.diff), ("unedited", 0.0, None))
         self.assertEqual(two.status, "edited")
-        # The diff shows only this macro's changes, not the other macro's text.
-        self.assertEqual(two.diff, [("equal", ["Second"]), ("delete", ["part."]), ("insert", ["piece."])])
+        # The other macro's text shows by name, not as words the agent added.
+        self.assertEqual(two.diff, [("macro", ["Macro 1"]), ("equal", ["Second"]), ("delete", ["part."]),
+                                    ("insert", ["piece."])])
+
+    def test_other_macro_named_where_it_sits_among_added_words(self):
+        result = run_audit([use_macro(1, "One two three four."), use_macro(2, "Middle bit.")], [1, 2],
+                           "One two extra Middle bit. more three four.")
+        self.assertEqual(result.uses[0].diff, [("equal", ["One", "two"]), ("insert", ["extra"]),
+                                               ("macro", ["Macro 2"]), ("insert", ["more"]),
+                                               ("equal", ["three", "four."])])
 
     def test_combined_with_names_the_other_macros(self):
         result = run_audit([use_macro(1, "First part."), use_macro(2, "Second part.")], [1, 2],

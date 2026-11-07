@@ -140,14 +140,63 @@ class _Comment:
         return (i >= 2 and self.tokens[i - 1] in _WORD_JOINERS and self.is_word[i - 2]
                 and self.spans[i - 2][1] == self.spans[i - 1][0] and self.spans[i - 1][1] == self.spans[i][0])
 
-    def without(self, claimed: list[tuple[int, int]]) -> list[str]:
-        """The comment's words, leaving out the given ranges of tokens."""
-        pieces, position = [], 0
-        for start, end in sorted(claimed):
-            pieces.append(self.text[position:self.spans[start][0]])
-            position = self.spans[end - 1][1]
-        pieces.append(self.text[position:])
-        return " ".join(pieces).split()
+    def without(self, owners: dict[int, int]) -> list[str]:
+        """The comment's space-separated words, with each stretch of another macro's text as one marker.
+
+        `owners` maps a token to the other macro it's credited to. Punctuation
+        goes with the word it touches, so "order." is replaced whole, and
+        "help.Thanks" is a marker then "Thanks". A lone "—" stays unless it sits
+        inside another macro's text.
+        """
+        out: list[str] = []
+
+        def add(item: str) -> None:
+            if not (out and item == out[-1] and macro_marker(item) is not None):
+                out.append(item)
+
+        token = 0
+        for chunk in re.finditer(r"\S+", self.text):
+            inside: list[int] = []
+            units: list[list[int]] = []  # each word with the punctuation after it
+            lead: list[int] = []         # punctuation before the chunk's first word
+            while token < len(self.tokens) and self.spans[token][0] < chunk.end():
+                inside.append(token)
+                if self.is_word[token]:
+                    units.append(lead + [token])
+                    lead = []
+                elif units:
+                    units[-1].append(token)
+                else:
+                    lead.append(token)
+                token += 1
+            if not units:
+                found = {owners.get(i) for i in inside}
+                only = found.pop() if len(found) == 1 else None
+                add(chunk.group(0) if only is None else _marker(only))
+                continue
+            text = ""
+            for unit in units:
+                other = owners.get(next(i for i in unit if self.is_word[i]))
+                if other is None:
+                    text += self.text[self.spans[unit[0]][0]:self.spans[unit[-1]][1]]
+                    continue
+                if text:
+                    add(text)
+                    text = ""
+                add(_marker(other))
+            if text:
+                add(text)
+        return out
+
+
+def _marker(index: int) -> str:
+    return f"\x00{index}\x00"
+
+
+def macro_marker(word: str) -> int | None:
+    """Which macro a diff word stands in for, by its place in the list given to compare(), or None for a real word."""
+    match = re.fullmatch(r"\x00(\d+)\x00", word)
+    return int(match.group(1)) if match else None
 
 
 # ---- What a macro compiles to --------------------------------------------------
@@ -498,33 +547,43 @@ def compare(macros: list[Macro], sent: str) -> Comparison:
     """Compare the sent text against every comparable macro applied in the same update."""
     comment = _Comment(sent)
     placed = _place([_candidates(macro, comment) for macro in macros])
-    claimed = [False] * len(comment.tokens)
-    for start, end in placed.values():
-        claimed[start:end] = [True] * (end - start)
+    owner: list[int | None] = [None] * len(comment.tokens)  # which macro each token is credited to
+    for index, (start, end) in placed.items():
+        owner[start:end] = [index] * (end - start)
     # Outer placeholders only get text that no macro's fixed text needs.
     for index, (start, end) in placed.items():
-        placed[index] = _extend(comment, claimed, start, end, macros[index])
-        start, end = placed[index]
-        claimed[start:end] = [True] * (end - start)
-    remaining = comment.without(list(placed.values()))
+        claimed = [o is not None for o in owner]
+        start, end = _extend(comment, claimed, start, end, macros[index])
+        owner[start:end] = [index] * (end - start)
 
     results: list[MacroResult | None] = [
         MacroResult(True, 0.0) if index in placed else None for index in range(len(macros))
     ]
     # Measure edited macros largest first, so a word only counts toward one of them.
     edited = [index for index, result in enumerate(results) if result is None]
-    available = {comment.tokens[i] for i in range(len(claimed)) if not claimed[i]}
+    available = {comment.tokens[i] for i in range(len(owner)) if owner[i] is None}
     outlines = {index: _outline(macros[index].core, available) for index in edited}
+    measured = {}
     for index in sorted(edited, key=lambda i: -sum(isinstance(item, str) for item in outlines[i])):
-        open_words = [i for i in range(len(claimed)) if comment.is_word[i] and not claimed[i]]
+        open_words = [i for i in range(len(owner)) if comment.is_word[i] and owner[i] is None]
         pct, matches = _pct_of_macro(outlines[index], [comment.tokens[i] for i in open_words],
                                      [comment.starts_word[i] for i in open_words])
         for start, size in matches:
             for i in open_words[start:start + size]:
-                claimed[i] = True
-        results[index] = MacroResult(False, pct, _word_diff(macros[index].display_words, remaining))
+                owner[i] = index
+        measured[index] = pct
+    added = any(comment.is_word[i] and owner[i] is None for i in range(len(owner)))
 
-    added = any(comment.is_word[i] and not claimed[i] for i in range(len(claimed)))
+    # Diffs come last, once every macro has its words. Another macro's words aren't the agent's, so
+    # they show as a marker, and words changed inside a macro belong to its diff, not to the others'.
+    for index in measured:
+        own = [i for i, o in enumerate(owner) if o == index]
+        for i in range(own[0], own[-1]) if own else ():
+            if owner[i] is None:
+                owner[i] = index
+    for index, pct in measured.items():
+        others = {i: o for i, o in enumerate(owner) if o is not None and o != index}
+        results[index] = MacroResult(False, pct, _word_diff(macros[index].display_words, comment.without(others)))
     return Comparison(results, added)
 
 

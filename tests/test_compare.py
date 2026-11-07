@@ -2,7 +2,7 @@ import time
 import unittest
 
 from zdaudit.analyze import macro_text
-from zdaudit.compare import MAX_EXACT_MACROS, _place, compare, compile_macro, html_to_text, is_placeholder
+from zdaudit.compare import MAX_EXACT_MACROS, _place, compare, compile_macro, html_to_text, is_placeholder, macro_marker
 
 GREETING = "Hi {{ticket.requester.first_name}},\n\nThanks for writing in. We fixed it."
 BODY = "Thanks for writing in. We fixed it."
@@ -254,6 +254,38 @@ class EditTests(CompareBase):
     def test_diff_keeps_placeholders_visible(self):
         result = check("Hi {{ticket.requester.first_name}} bye", "Hello Sam bye").results[0]
         self.assertIn(("delete", ["Hi", "{{ticket.requester.first_name}}"]), result.diff)
+
+    def test_diff_marks_another_edited_macros_words(self):
+        first = "Thanks for reaching out about your order today."
+        second = "Please reply with your account number so we can help."
+        sent = "Thanks for reaching out about the order. Please reply with the account number so we can help."
+        one, two = check([first, second], sent).results
+        self.assertEqual(one.diff, [("equal", ["Thanks", "for", "reaching", "out", "about"]),
+                                    ("delete", ["your", "order", "today."]), ("insert", ["the", "order.", "\x001\x00"])])
+        self.assertEqual(two.diff, [("insert", ["\x000\x00"]), ("equal", ["Please", "reply", "with"]), ("delete", ["your"]), ("insert", ["the"]),
+                                    ("equal", ["account", "number", "so", "we", "can", "help."])])
+
+    def test_diff_marks_an_intact_macro_joined_with_no_space(self):
+        # Zendesk inserts macros applied one after another with no space between them.
+        sent = "Thanks for writing in.Please reply with the account number. Cheers"
+        intact, edited = check(["Thanks for writing in.", "Please reply with your account number."], sent).results
+        self.assertTrue(intact.intact)
+        self.assertEqual(edited.diff, [("insert", ["\x000\x00"]), ("equal", ["Please", "reply", "with"]), ("delete", ["your"]), ("insert", ["the"]),
+                                       ("equal", ["account", "number."]), ("insert", ["Cheers"])])
+
+    def test_diff_marks_a_macro_inside_another_once(self):
+        outer = "Here is an update on your request. Our engineers are working on a fix now."
+        inner = "We will email you \u2014 as soon as it is resolved."  # a lone dash inside it stays part of it
+        sent = "Here is an update on your request. We will email you \u2014 as soon as it is resolved. Our engineers are working on a fix now."
+        edited, intact = check([outer, inner], sent).results
+        self.assertTrue(intact.intact)
+        self.assertEqual(edited.pct_of_macro, 0.1)
+        self.assertEqual(edited.diff, [("equal", ["Here", "is", "an", "update", "on", "your", "request."]),
+                                       ("insert", ["\x001\x00"]),
+                                       ("equal", ["Our", "engineers", "are", "working", "on", "a", "fix", "now."])])
+
+    def test_macro_marker(self):
+        self.assertEqual([macro_marker(w) for w in ("\x000\x00", "\x0012\x00", "12", "\x00a\x00")], [0, 12, None, None])
 
 
 class FormattingTests(CompareBase):

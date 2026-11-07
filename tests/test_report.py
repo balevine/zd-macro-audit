@@ -49,6 +49,12 @@ class DiffTests(unittest.TestCase):
         self.assertEqual(_render_diff([("equal", ["a"]), ("delete", ["b"]), ("insert", ["c"])]),
                          "<span>a</span> <del>b</del> <ins>c</ins>")
 
+    def test_another_macro_is_named_in_brackets(self):
+        html = _render_diff([("equal", ["a"]), ("macro", ["Say <hi>"]), ("equal", ["b"])])
+        self.assertEqual(html, '<span>a</span> <span class="other" data-tip="The text of Say &lt;hi&gt;, applied in '
+                               'the same update. It counts toward that macro, not this one.">[Say &lt;hi&gt;]</span> '
+                               '<span>b</span>')
+
     def test_text_is_escaped(self):
         self.assertEqual(_render_diff([("insert", ["<b>"]), ("equal", ["&"]), ("delete", ["<i>"])]),
                          "<ins>&lt;b&gt;</ins> <span>&amp;</span> <del>&lt;i&gt;</del>")

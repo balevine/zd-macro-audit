@@ -7,7 +7,7 @@ from datetime import datetime
 from statistics import mean
 from typing import Iterable
 
-from .compare import compare, compile_macro, html_to_text
+from .compare import compare, compile_macro, html_to_text, macro_marker
 from .zendesk import Coverage, is_macro_event, parse_time
 
 # Only these two statuses count toward the edited percentage.
@@ -126,7 +126,8 @@ def analyze(audits: list[dict], macros: dict[str, dict], users: dict[str, dict],
                 diff = [("delete", compiled[mid].display_words)]
             else:
                 result = results[mid]
-                pct_of_macro, diff = result.pct_of_macro, result.diff
+                pct_of_macro = result.pct_of_macro
+                diff = _name_other_macros(result.diff, [titles[o] for o in to_compare])
                 updated_at = macros[mid].get("updated_at")
                 if result.intact:
                     status = "unedited"
@@ -151,6 +152,28 @@ def analyze(audits: list[dict], macros: dict[str, dict], users: dict[str, dict],
 
     return Result(since, until, uses, users, _overall(uses), _by_agent(uses, users), _by_macro(uses, macros),
                   coverage or Coverage())
+
+
+def _name_other_macros(diff: list[tuple[str, list[str]]] | None,
+                       titles: list[str]) -> list[tuple[str, list[str]]] | None:
+    """Turn each marker for another macro's text into a ("macro", [title]) step of the diff."""
+    if diff is None:
+        return None
+    named: list[tuple[str, list[str]]] = []
+    for op, words in diff:
+        run: list[str] = []
+        for word in words:
+            other = macro_marker(word)
+            if other is None:
+                run.append(word)
+                continue
+            if run:
+                named.append((op, run))
+                run = []
+            named.append(("macro", [titles[other]]))
+        if run:
+            named.append((op, run))
+    return named
 
 
 def _pct(part: int, whole: int) -> float | None:

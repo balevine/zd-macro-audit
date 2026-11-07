@@ -201,7 +201,8 @@ def _render_diff(ops: list[tuple[str, list[str]]], context: int = 8) -> str:
     added. N is always 4 or more there, so the wording is always plural.
 
     A placeholder replaced by the same number of words is Zendesk filling it
-    in, not an edit, so those words are shown in a neutral style.
+    in, not an edit, so those words are shown in a neutral style. So is a
+    ("macro", [title]) step, where another macro's text sat in the saved text.
     """
     def show(words: list[str]) -> str:
         return " ".join(f'<span class="ph">{escape(w)}</span>' if is_placeholder(w) else escape(w) for w in words)
@@ -219,6 +220,11 @@ def _render_diff(ops: list[tuple[str, list[str]]], context: int = 8) -> str:
             if op == "insert":
                 title = escape(" ".join(ops[i - 1][1]))
                 parts.append(f'<span class="fill" data-tip="Zendesk filled in {title}">{escape(" ".join(words))}</span>')
+            continue
+        if op == "macro":
+            title = escape(words[0])
+            parts.append(f'<span class="other" data-tip="The text of {title}, applied in the same update. '
+                         f'It counts toward that macro, not this one.">[{title}]</span>')
             continue
         if op == "equal":
             if len(words) > 2 * context + 3:
@@ -511,7 +517,7 @@ def render_html(result: Result, subdomain: str | None) -> str:
   </table></div>
 
   <h2>Every macro use</h2>
-  <p class="muted">Click an "Edited" badge to see what changed. Struck-out text was in the macro but not sent. Highlighted text was added by the agent. Underlined text is a placeholder Zendesk filled in.</p>
+  <p class="muted">Click an "Edited" badge to see what changed. Struck-out text was in the macro but not sent. Highlighted text was added by the agent. Underlined text is a placeholder Zendesk filled in. A macro name in [brackets] shows where another macro applied in the same update went.</p>
   <div class="filters">
     <input id="q" type="search" placeholder="Search agent, macro or ticket number">
     <select id="status"><option value="">All results</option>{status_options}</select>
