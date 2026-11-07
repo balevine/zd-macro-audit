@@ -235,3 +235,5 @@ Some uses can't be judged, so they're left out of the percentages and listed sep
 ## License
 
 This project uses the MIT License. See [LICENSE](LICENSE).
+
+Just getting started? Read the [guide](docs/getting-started.md) for step-by-step instructions, from getting the tool to reading your first report.
