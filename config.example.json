@@ -1,7 +1,5 @@
 {
   "subdomain": "acme",
   "client_id": "macro_edit_audit",
-  "client_secret": "paste the secret from Admin Center here",
-  "email": "",
-  "api_token": ""
+  "email": ""
 }

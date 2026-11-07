@@ -1,38 +1,80 @@
-"""Compare the text an agent sent with the text a macro inserts.
+"""Work out which words of a sent comment came from which macro.
 
-A use counts as unedited only when the sent comment equals the macro text.
+Each macro is compiled into fixed text and gaps for its placeholders, then
+aligned against the comment's words. A word is only ever credited to one macro.
+Everything else follows from that alignment:
+
+- A macro is intact when all of its fixed text appears, in order and unbroken.
+- Its edit percentage is how many of its fixed words were removed or changed, or
+  had words inserted among them, as a share of its fixed words.
+- Text was added when words are left over that no macro claimed.
+
 Differences in whitespace, formatting marks (bold, links, list bullets) and
-curly versus straight quotes are ignored. Placeholders such as
-{{ticket.requester.first_name}} match any text, because Zendesk fills them in
-before it saves the comment. Dynamic content placeholders ({{dc.name}}) match
-any of that item's variants when we know them.
+curly versus straight quotes are ignored. A placeholder may only fill a limited
+number of words, so a long filled-in value can count as an edit. That's on
+purpose: it's better to flag one than to let added text pass as part of a
+placeholder.
 """
 from __future__ import annotations
 
 import html
-import itertools
 import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from html.parser import HTMLParser
 
-# Liquid blocks ({% if %}...{% endif %}) come first so their contents are
-# treated as part of the placeholder, since they may or may not appear.
-PLACEHOLDER = re.compile(
-    r"\{%-?\s*(?P<tag>if|unless|case|for|capture)\b.*?\{%-?\s*end(?P=tag)\s*-?%\}"
-    r"|\{\{.*?\}\}"
-    r"|\{%.*?%\}",
-    re.S,
+# How many words each kind of placeholder may fill. The first match wins.
+GAP_LIMITS = (
+    (re.compile(r"comment|description"), 200),
+    (re.compile(r"signature"), 40),
+    (re.compile(r"url|link|title|subject"), 15),
+    (re.compile(r"(?:^|\.)ticket_field_\d+$"), 15),   # custom fields are often free text
+    (re.compile(r"email"), 8),
+    (re.compile(r"phone"), 6),
+    (re.compile(r"first_name|last_name"), 3),
+    (re.compile(r"name"), 6),
+    (re.compile(r"(?:^|[._])id$"), 3),
 )
-_DC = re.compile(r"\{\{\s*(dc\.[\w.-]+)\s*\}\}", re.I)
+DEFAULT_GAP = 5
+UNKNOWN_DC_GAP = 100   # dynamic content we couldn't read could be any length
+LOOP_GAP = 30          # {% for %} repeats its contents an unknown number of times
+MAX_DC_DEPTH = 3       # dynamic content can include other dynamic content
+MAX_PLACEMENTS = 50    # places to consider for one macro in one comment, to bound the search
+# The exact placement search doubles in time with each macro in one update. Updates
+# normally apply 1 to 3, so past this many a greedy placement is used instead.
+MAX_EXACT_MACROS = 8
+
+_TAG = re.compile(r"\{\{.*?\}\}|\{%.*?%\}", re.S)
+_TAG_NAME = re.compile(r"\{%-?\s*(\w+)")
+_PLACEHOLDER_NAME = re.compile(r"\{\{-?\s*([\w.-]+)")
 _SLOT = re.compile(r"\x00(\d+)\x00")
+_HTML_TAG = re.compile(
+    r"</?(?:p|div|br|ul|ol|li|span|strong|b|i|u|s|em|a|h[1-6]|blockquote|table|tr|td|th|img|hr|pre|code)\b[^>]*>",
+    re.I,
+)
+
+# Liquid blocks whose contents may render, and those that never render.
+_CHOICE_BLOCKS = {"if", "unless", "case"}
+_BLOCKS = _CHOICE_BLOCKS | {"for", "capture", "comment"}
+
+# Letters, digits and punctuation are separate tokens, so "Hi {{name}}," lines
+# up with "Hi Sam,". Chinese, Japanese and Korean characters are one token each.
+_TOKEN = re.compile(r"[぀-ヿ㐀-鿿가-힯]|\d+|[^\W\d_]+|\S")
+
+_WORD_JOINERS = {"-", "'"}
 
 _CHAR_MAP = str.maketrans({
     "‘": "'", "’": "'", "“": '"', "”": '"',
-    " ": " ", "​": "",
+    "\xa0": " ",
+    "​": "", "‌": "", "‍": "", "⁠": "", "﻿": "", "\xad": "",
 })
-_MD_LINK = re.compile(r"!?\[([^\]]*)\]\([^)]*\)")
-_MD_MARKS = re.compile(r"\*\*|__|~~")
+_MD_ESCAPE = re.compile(r"\\([\\`*_{}\[\]()#+.!>-])")
+_MD_IMAGE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+_MD_LINK = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+_MD_RULE = re.compile(r"^[ \t]*(?:-{3,}|\*{3,}|_{3,})[ \t]*$", re.M)
+_MD_MARKS = re.compile(r"\*\*|__|~~|`")
+_MD_STAR = re.compile(r"(?<![\w*])\*(?=\S)([^*\n]+?)(?<=\S)\*(?![\w*])")
+_MD_UNDERSCORE = re.compile(r"(?<![\w_])_(?=\S)([^_\n]+?)(?<=\S)_(?![\w_])")
 _LINE_MARKS = re.compile(r"^[ \t]*(?:#{1,6}[ \t]+|>[ \t]?|[-*+•][ \t]+|\d+[.)][ \t]+)", re.M)
 
 
@@ -65,108 +107,428 @@ def html_to_text(markup: str) -> str:
     return "".join(parser.parts)
 
 
-def normalize(text: str) -> str:
+def _normalize(text: str) -> str:
     text = html.unescape(text).translate(_CHAR_MAP)
+    text = _MD_ESCAPE.sub(r"\1", text)
+    text = _MD_IMAGE.sub("", text)
     text = _MD_LINK.sub(r"\1", text)
+    text = _MD_RULE.sub("", text)
     text = _MD_MARKS.sub("", text)
+    text = _MD_STAR.sub(r"\1", text)
+    text = _MD_UNDERSCORE.sub(r"\1", text)
     text = _LINE_MARKS.sub("", text)
     return " ".join(text.split())
 
 
+def _is_word(token: str) -> bool:
+    return token[0].isalnum()
+
+
+# ---- The comment -------------------------------------------------------------
+
+class _Comment:
+    def __init__(self, sent: str):
+        self.text = _normalize(sent)
+        found = list(_TOKEN.finditer(self.text))
+        self.tokens = tuple(m.group(0) for m in found)
+        self.spans = [m.span() for m in found]
+        self.is_word = [_is_word(t) for t in self.tokens]
+        # Mary-Jane and O'Neil are one word each when counting what a placeholder filled.
+        self.starts_word = [self.is_word[i] and not self._continues_word(i) for i in range(len(self.tokens))]
+
+    def _continues_word(self, i: int) -> bool:
+        return (i >= 2 and self.tokens[i - 1] in _WORD_JOINERS and self.is_word[i - 2]
+                and self.spans[i - 2][1] == self.spans[i - 1][0] and self.spans[i - 1][1] == self.spans[i][0])
+
+    def without(self, owners: dict[int, int]) -> list[str]:
+        """The comment's space-separated words, with each stretch of another macro's text as one marker.
+
+        `owners` maps a token to the other macro it's credited to. Punctuation
+        goes with the word it touches, so "order." is replaced whole, and
+        "help.Thanks" is a marker then "Thanks". A lone "—" stays unless it sits
+        inside another macro's text.
+        """
+        out: list[str] = []
+
+        def add(item: str) -> None:
+            if not (out and item == out[-1] and macro_marker(item) is not None):
+                out.append(item)
+
+        token = 0
+        for chunk in re.finditer(r"\S+", self.text):
+            inside: list[int] = []
+            units: list[list[int]] = []  # each word with the punctuation after it
+            lead: list[int] = []         # punctuation before the chunk's first word
+            while token < len(self.tokens) and self.spans[token][0] < chunk.end():
+                inside.append(token)
+                if self.is_word[token]:
+                    units.append(lead + [token])
+                    lead = []
+                elif units:
+                    units[-1].append(token)
+                else:
+                    lead.append(token)
+                token += 1
+            if not units:
+                found = {owners.get(i) for i in inside}
+                only = found.pop() if len(found) == 1 else None
+                add(chunk.group(0) if only is None else _marker(only))
+                continue
+            text = ""
+            for unit in units:
+                other = owners.get(next(i for i in unit if self.is_word[i]))
+                if other is None:
+                    text += self.text[self.spans[unit[0]][0]:self.spans[unit[-1]][1]]
+                    continue
+                if text:
+                    add(text)
+                    text = ""
+                add(_marker(other))
+            if text:
+                add(text)
+        return out
+
+
+def _marker(index: int) -> str:
+    return f"\x00{index}\x00"
+
+
+def macro_marker(word: str) -> int | None:
+    """Which macro a diff word stands in for, by its place in the list given to compare(), or None for a real word."""
+    match = re.fullmatch(r"\x00(\d+)\x00", word)
+    return int(match.group(1)) if match else None
+
+
+# ---- What a macro compiles to --------------------------------------------------
+
 @dataclass
-class Template:
-    pattern: re.Pattern
-    literal_words: list[str]   # macro words with placeholders left out, for scoring
-    display_words: list[str]   # macro words with placeholders kept, for diffs
+class _Literal:
+    tokens: tuple[str, ...]
+
+    def ends(self, comment: _Comment, start: int) -> set[int]:
+        end = start + len(self.tokens)
+        return {end} if comment.tokens[start:end] == self.tokens else set()
 
 
-def _parse(text: str, dynamic: dict[str, list[str]], depth: int = 0) -> tuple[str, list[str], list[str]]:
-    """Return (regex source, literal words, display words) for one macro text."""
-    slots: list[str] = []
+@dataclass
+class _Gap:
+    max_words: int
 
-    def stash(match: re.Match) -> str:
-        slots.append(match.group(0))
-        return f"\x00{len(slots) - 1}\x00"
+    def ends(self, comment: _Comment, start: int) -> set[int]:
+        found, words = {start}, 0
+        for i in range(start, len(comment.tokens)):
+            words += comment.starts_word[i]
+            if words > self.max_words:
+                break
+            found.add(i + 1)
+        return found
 
-    pieces = _SLOT.split(normalize(PLACEHOLDER.sub(stash, text)))
-    regex: list[str] = []
-    literal: list[str] = []
-    display: list[str] = []   # pieces of the display text, split into words at the end
-    for i, piece in enumerate(pieces):
-        if i % 2:  # a placeholder
-            slot = slots[int(piece)]
-            dc = _DC.fullmatch(slot.strip())
-            variants = dynamic.get(dc.group(1).lower()) if dc and depth < 3 else None
-            if variants:
-                parsed = [_parse(v, dynamic, depth + 1) for v in variants]
-                regex.append("(?:" + "|".join(p[0] for p in parsed) + ")")
-                literal.extend(parsed[0][1])
-                display.append(" ".join(parsed[0][2]))
-            else:
-                regex.append(".*?")
-                display.append(_compact(slot))
+
+@dataclass
+class _Choice:
+    options: list[list]
+
+    def ends(self, comment: _Comment, start: int) -> set[int]:
+        found: set[int] = set()
+        for option in self.options:
+            found |= _sequence_ends(option, comment, start)
+        return found
+
+
+def _sequence_ends(parts: list, comment: _Comment, start: int) -> set[int]:
+    """Every position in the comment where this run of parts could finish."""
+    ends = {start}
+    for part in parts:
+        ends = {after for end in ends for after in part.ends(comment, end)}
+    return ends
+
+
+# ---- Reading a macro's text ----------------------------------------------------
+
+@dataclass
+class _Placeholder:
+    source: str
+
+
+@dataclass
+class _Block:
+    tag: str
+    branches: list[list]
+    has_else: bool = False
+
+
+def _parse_tree(text: str) -> list:
+    """Split text into strings, placeholders and (possibly nested) Liquid blocks."""
+    root: list = []
+    current = root
+    stack: list[tuple[_Block, list]] = []
+    position = 0
+    for match in _TAG.finditer(text):
+        current.append(text[position:match.start()])
+        position = match.end()
+        source = match.group(0)
+        if source.startswith("{{"):
+            current.append(_Placeholder(source))
             continue
-        # Literal text. A space next to a placeholder is optional, because the
-        # placeholder may render as nothing and leave a single space behind.
-        core, lead, trail = piece, "", ""
-        if i > 0 and core.startswith(" "):
-            core, lead = core[1:], " ?"
-        if i < len(pieces) - 1 and core.endswith(" "):
-            core, trail = core[:-1], " ?"
-        regex.append(lead + re.escape(core) + trail)
-        literal.extend(core.split())
-        display.append(piece)
-    return "".join(regex), literal, "".join(display).split()
+        name_match = _TAG_NAME.match(source)
+        name = name_match.group(1) if name_match else ""
+        if name in _BLOCKS:
+            block = _Block(name, [] if name == "case" else [[]])
+            current.append(block)
+            stack.append((block, current))
+            current = block.branches[-1] if block.branches else []  # text before {% when %} never renders
+        elif name in ("elsif", "else", "when") and stack:
+            block = stack[-1][0]
+            block.has_else = block.has_else or name == "else"
+            block.branches.append([])
+            current = block.branches[-1]
+        elif name.startswith("end") and any(block.tag == name[3:] for block, _ in stack):
+            while True:
+                block, current = stack.pop()
+                if block.tag == name[3:]:
+                    break
+    current.append(text[position:])
+    return root
 
 
-def _compact(slot: str) -> str:
-    """A placeholder as one word, so it lines up with the word it turned into."""
-    if slot.startswith("{%"):
-        # Liquid output usually starts its own sentence, so keep it a separate word.
-        tag = re.match(r"\{%-?\s*(\w+)", slot)
-        return " {%" + (tag.group(1) if tag else "") + "…%} "
-    return "".join(slot.split())
+def _placeholder_name(source: str) -> str:
+    match = _PLACEHOLDER_NAME.match(source)
+    return match.group(1).lower() if match else ""
 
 
-def is_placeholder(word: str) -> bool:
-    return "{{" in word or "{%" in word
+def _gap_limit(name: str) -> int:
+    if name.startswith("dc."):
+        return UNKNOWN_DC_GAP
+    return next((limit for pattern, limit in GAP_LIMITS if pattern.search(name)), DEFAULT_GAP)
 
 
-def build_template(text: str, dynamic: dict[str, list[str]] | None = None) -> Template:
-    source, literal, display = _parse(text, dynamic or {})
-    return Template(re.compile(source, re.S), literal, display)
+def _compile_placeholder(node: _Placeholder, dynamic: dict[str, list[str]], depth: int) -> tuple[list, str]:
+    name = _placeholder_name(node.source)
+    variants = dynamic.get(name) if name.startswith("dc.") and depth < MAX_DC_DEPTH else None
+    if not variants:
+        return [_Gap(_gap_limit(name))], "".join(node.source.split())
+    # A variant may be stored as HTML, which needs the same treatment as a rich text macro.
+    compiled = [
+        _compile_nodes(_parse_tree(html_to_text(v) if _HTML_TAG.search(v) else v), dynamic, depth + 1)
+        for v in variants
+    ]
+    return [_Choice([parts for parts, _ in compiled])], compiled[0][1]
+
+
+def _compile_block(node: _Block, dynamic: dict[str, list[str]], depth: int) -> tuple[list, str]:
+    label = f" {{%{node.tag}…%}} "   # Liquid output usually starts its own sentence
+    if node.tag == "for":
+        return [_Gap(LOOP_GAP)], label
+    if node.tag in _CHOICE_BLOCKS:
+        options = [_compile_nodes(branch, dynamic, depth)[0] for branch in node.branches]
+        if not node.has_else:
+            options.append([])
+        return [_Choice(options)], label
+    return [], ""  # {% capture %} and {% comment %} render nothing
+
+
+def _compile_nodes(nodes: list, dynamic: dict[str, list[str]], depth: int) -> tuple[list, str]:
+    """Return (parts, display text). Text is normalized as a whole, with slots for the rest."""
+    slots: list = []
+    joined: list[str] = []
+    for node in nodes:
+        if isinstance(node, str):
+            joined.append(node)
+        else:
+            joined.append(f"\x00{len(slots)}\x00")
+            slots.append(node)
+
+    parts: list = []
+    display: list[str] = []
+    for i, piece in enumerate(_SLOT.split(_normalize("".join(joined)))):
+        if i % 2 == 0:
+            tokens = tuple(_TOKEN.findall(piece))
+            if tokens:
+                parts.append(_Literal(tokens))
+            display.append(piece)
+            continue
+        node = slots[int(piece)]
+        compile_slot = _compile_placeholder if isinstance(node, _Placeholder) else _compile_block
+        slot_parts, slot_display = compile_slot(node, dynamic, depth)
+        parts.extend(slot_parts)
+        display.append(slot_display)
+    return parts, "".join(display)
+
+
+def _required_words(parts: list) -> int:
+    """How many fixed words must appear, whichever options are taken."""
+    total = 0
+    for part in parts:
+        if isinstance(part, _Literal):
+            total += sum(_is_word(t) for t in part.tokens)
+        elif isinstance(part, _Choice):
+            total += min(_required_words(option) for option in part.options)
+    return total
+
+
+@dataclass
+class Macro:
+    core: list                 # parts from the first to the last that isn't a placeholder gap
+    lead_words: int            # words the placeholders before the core can fill
+    trail_words: int           # words the placeholders after the core can fill
+    display_words: list[str]   # macro words with placeholders kept, for diffs
+    comparable: bool           # False when nothing but placeholders is certain, so any comment could match
+
+
+def compile_macro(text: str, dynamic: dict[str, list[str]] | None = None) -> Macro:
+    parts, display = _compile_nodes(_parse_tree(text), dynamic or {}, 0)
+    first = next((i for i, part in enumerate(parts) if not isinstance(part, _Gap)), len(parts))
+    last = next((i for i in range(len(parts), first, -1) if not isinstance(parts[i - 1], _Gap)), first)
+    return Macro(
+        parts[first:last],
+        sum(part.max_words for part in parts[:first]),
+        sum(part.max_words for part in parts[last:]),
+        display.split(),
+        _required_words(parts) > 0,
+    )
+
+
+# ---- Comparing ---------------------------------------------------------------
+
+@dataclass
+class MacroResult:
+    intact: bool
+    pct_of_macro: float  # 0 to 100, how much of the macro was edited, where 0 means intact
+    diff: list[tuple[str, list[str]]] | None = None
 
 
 @dataclass
 class Comparison:
-    matched: bool
-    similarity: float  # 0 to 100, where 100 means the macro text was sent as is
-    template: Template
+    results: list[MacroResult]  # one per macro, in the order given
+    added_text: bool            # words are left over that no macro accounts for
 
 
-def compare(macro_texts: list[str], sent: str, dynamic: dict[str, list[str]] | None = None) -> Comparison:
-    """Compare sent text against one or more macro texts applied in the same update.
+def _outline(parts: list, available: set[str]) -> list:
+    """The macro as fixed words and gap sizes, taking the option closest to what was sent."""
+    outline: list = []
+    for part in parts:
+        if isinstance(part, _Literal):
+            outline.extend(t for t in part.tokens if _is_word(t))
+        elif isinstance(part, _Gap):
+            outline.append(part.max_words)
+        else:
+            options = [_outline(option, available) for option in part.options]
+            outline.extend(max(options, key=lambda o: (
+                sum(item in available for item in o if isinstance(item, str)),
+                -sum(isinstance(item, str) for item in o),
+            )))
+    return outline
 
-    When several macros were applied, their texts may appear in any order, so
-    each order is tried (up to three macros).
+
+def _pct_of_macro(outline: list, sent_words: list[str], starts_word: list[bool]) -> tuple[float, list[tuple[int, int]]]:
+    """How much of a macro was edited, and which runs of sent words matched it (start, length).
+
+    A replaced stretch counts as its longer side. Words inserted where a
+    placeholder sits only count beyond what the placeholder can fill. Words
+    before the macro's first match or after its last are text added around it,
+    so they don't count.
     """
-    sent_norm = normalize(sent)
-    sent_words = sent_norm.split()
-    orders = itertools.permutations(macro_texts) if len(macro_texts) <= 3 else [macro_texts]
-    best: Comparison | None = None
-    for order in orders:
-        template = build_template("\n\n".join(order), dynamic)
-        if template.pattern.fullmatch(sent_norm):
-            return Comparison(True, 100.0, template)
-        ratio = SequenceMatcher(None, template.literal_words, sent_words, autojunk=False).ratio()
-        score = min(round(ratio * 100, 1), 99.9)
-        if best is None or score > best.similarity:
-            best = Comparison(False, score, template)
-    assert best is not None
-    return best
+    words: list[str] = []
+    free: dict[int, int] = {}   # position in words -> how many words a gap there can fill
+    for item in outline:
+        if isinstance(item, str):
+            words.append(item)
+        else:
+            free[len(words)] = free.get(len(words), 0) + item
+    matcher = SequenceMatcher(None, words, sent_words, autojunk=False)
+    changed = 0
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        if i1 == 0 or i2 == len(words):
+            changed += i2 - i1
+        else:
+            allowed = sum(free.get(i, 0) for i in range(i1, i2 + 1))
+            changed += max(i2 - i1, sum(starts_word[j1:j2]) - allowed)
+    # An edited macro never reads 0%, even if only its punctuation changed.
+    pct = min(max(round(100 * changed / len(words), 1), 0.1), 100.0)
+    return pct, [(block.b, block.size) for block in matcher.get_matching_blocks() if block.size]
 
 
-def word_diff(before: list[str], after: list[str]) -> list[tuple[str, list[str]]]:
+def _candidates(macro: Macro, comment: _Comment) -> list[tuple[int, int]]:
+    """Each (start, end) range of tokens where this macro's core could sit, longest kept first."""
+    found = []
+    for start in range(len(comment.tokens)):
+        found.extend((start, end) for end in _sequence_ends(macro.core, comment, start) if end > start)
+    found.sort(key=lambda r: (r[0] - r[1], r[0]))
+    return sorted(found[:MAX_PLACEMENTS])
+
+
+def _extend(comment: _Comment, claimed: list[bool], start: int, end: int, macro: Macro) -> tuple[int, int]:
+    """Widen a placed macro over free text its outer placeholders could have filled."""
+    if macro.lead_words:
+        words = 0
+        while start > 0 and not claimed[start - 1] and words + comment.starts_word[start - 1] <= macro.lead_words:
+            start -= 1
+            words += comment.starts_word[start]
+    if macro.trail_words:
+        words = 0
+        while end < len(claimed) and not claimed[end] and words + comment.starts_word[end] <= macro.trail_words:
+            words += comment.starts_word[end]
+            end += 1
+    return start, end
+
+
+def _place_greedy(candidates: list[list[tuple[int, int]]]) -> dict[int, tuple[int, int]]:
+    """Place the longest ranges first, then the earliest, each macro once, with no word shared.
+
+    Length is in tokens, as the exact search counts text. Fast but not always
+    best: a long range can block two shorter macros that would both have fit.
+    Macros with the same range go in the order they were applied.
+    """
+    claimed: set[int] = set()
+    placed: dict[int, tuple[int, int]] = {}
+    ranges = [(start, end, index) for index, found in enumerate(candidates) for start, end in found]
+    for start, end, index in sorted(ranges, key=lambda r: (r[0] - r[1], r[0], r[2])):
+        if index in placed or claimed.intersection(range(start, end)):
+            continue
+        placed[index] = (start, end)
+        claimed.update(range(start, end))
+    # In text order, as the exact search gives them.
+    return dict(sorted(placed.items(), key=lambda item: item[1]))
+
+
+def _place(candidates: list[list[tuple[int, int]]]) -> dict[int, tuple[int, int]]:
+    """Give each macro its own range of the comment, with no word shared.
+
+    Up to MAX_EXACT_MACROS it tries every arrangement. It keeps the most macros
+    intact, then accounts for the most text, then takes the earliest text, so the
+    result doesn't depend on the order macros were applied. Only macros with
+    identical text can still tie. Past that it places greedily.
+    """
+    if len(candidates) > MAX_EXACT_MACROS:
+        return _place_greedy(candidates)
+    memo: dict[tuple[int, int], tuple[int, int, tuple]] = {}
+
+    def rank(option: tuple[int, int, tuple]) -> tuple:
+        placed, covered, spots = option
+        return placed, covered, tuple((-start, -end) for _, start, end in spots)
+
+    def best(position: int, used: int) -> tuple[int, int, tuple]:
+        key = (position, used)
+        if key not in memo:
+            result = (0, 0, ())
+            for index, ranges in enumerate(candidates):
+                if used >> index & 1:
+                    continue
+                for start, end in ranges:
+                    if start >= position:
+                        placed, covered, rest = best(end, used | 1 << index)
+                        option = (placed + 1, covered + end - start, ((index, start, end), *rest))
+                        if rank(option) > rank(result):
+                            result = option
+            memo[key] = result
+        return memo[key]
+
+    return {index: (start, end) for index, start, end in best(0, 0)[2]}
+
+
+def _word_diff(before: list[str], after: list[str]) -> list[tuple[str, list[str]]]:
     """Word-level diff as a list of ("equal" | "delete" | "insert", words)."""
     ops: list[tuple[str, list[str]]] = []
     matcher = SequenceMatcher(None, before, after, autojunk=False)
@@ -179,3 +541,51 @@ def word_diff(before: list[str], after: list[str]) -> list[tuple[str, list[str]]
         if j2 > j1:
             ops.append(("insert", after[j1:j2]))
     return ops
+
+
+def compare(macros: list[Macro], sent: str) -> Comparison:
+    """Compare the sent text against every comparable macro applied in the same update."""
+    comment = _Comment(sent)
+    placed = _place([_candidates(macro, comment) for macro in macros])
+    owner: list[int | None] = [None] * len(comment.tokens)  # which macro each token is credited to
+    for index, (start, end) in placed.items():
+        owner[start:end] = [index] * (end - start)
+    # Outer placeholders only get text that no macro's fixed text needs.
+    for index, (start, end) in placed.items():
+        claimed = [o is not None for o in owner]
+        start, end = _extend(comment, claimed, start, end, macros[index])
+        owner[start:end] = [index] * (end - start)
+
+    results: list[MacroResult | None] = [
+        MacroResult(True, 0.0) if index in placed else None for index in range(len(macros))
+    ]
+    # Measure edited macros largest first, so a word only counts toward one of them.
+    edited = [index for index, result in enumerate(results) if result is None]
+    available = {comment.tokens[i] for i in range(len(owner)) if owner[i] is None}
+    outlines = {index: _outline(macros[index].core, available) for index in edited}
+    measured = {}
+    for index in sorted(edited, key=lambda i: -sum(isinstance(item, str) for item in outlines[i])):
+        open_words = [i for i in range(len(owner)) if comment.is_word[i] and owner[i] is None]
+        pct, matches = _pct_of_macro(outlines[index], [comment.tokens[i] for i in open_words],
+                                     [comment.starts_word[i] for i in open_words])
+        for start, size in matches:
+            for i in open_words[start:start + size]:
+                owner[i] = index
+        measured[index] = pct
+    added = any(comment.is_word[i] and owner[i] is None for i in range(len(owner)))
+
+    # Diffs come last, once every macro has its words. Another macro's words aren't the agent's, so
+    # they show as a marker, and words changed inside a macro belong to its diff, not to the others'.
+    for index in measured:
+        own = [i for i, o in enumerate(owner) if o == index]
+        for i in range(own[0], own[-1]) if own else ():
+            if owner[i] is None:
+                owner[i] = index
+    for index, pct in measured.items():
+        others = {i: o for i, o in enumerate(owner) if o is not None and o != index}
+        results[index] = MacroResult(False, pct, _word_diff(macros[index].display_words, comment.without(others)))
+    return Comparison(results, added)
+
+
+def is_placeholder(word: str) -> bool:
+    return "{{" in word or "{%" in word

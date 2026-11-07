@@ -1,4 +1,5 @@
 config.json
 .tokens/
 reports/
+tmp/
 __pycache__/
