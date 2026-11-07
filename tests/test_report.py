@@ -468,28 +468,40 @@ class RankedListTests(unittest.TestCase):
         return re.findall(r'class="lt">(.*?)<', often), re.findall(r'class="lt">(.*?)<', kept)
 
     def test_needs_five_compared_uses(self):
-        often, kept = self.lists({1: (2, 3), 2: (2, 2)})
+        often, kept = self.lists({1: (3, 2), 2: (2, 2)})
         self.assertEqual((often, kept), (["Macro 1"], []))
 
     def test_order_and_separation(self):
-        often, kept = self.lists({1: (1, 4), 2: (4, 1), 3: (0, 5)})
+        often, kept = self.lists({1: (3, 2), 2: (4, 1), 3: (0, 5), 4: (1, 4)})
         self.assertEqual(often, ["Macro 2", "Macro 1"])
-        self.assertEqual(kept, ["Macro 3"])
+        self.assertEqual(kept, ["Macro 3", "Macro 4"])
+
+    def test_split_at_half_of_uses_edited(self):
+        often, kept = self.lists({1: (5, 5), 2: (4, 5), 3: (1, 9)})
+        self.assertEqual(often, ["Macro 1"])
+        self.assertEqual(kept, ["Macro 3", "Macro 2"])
+
+    def test_mostly_edited_macros_are_never_listed_as_kept_intact(self):
+        often, kept = self.lists({mid: (9, 1) for mid in range(1, 7)})
+        self.assertEqual((len(often), kept), (5, []))
 
     def test_a_tie_goes_to_the_macro_with_more_uses(self):
         often, _ = self.lists({1: (5, 5), 2: (10, 10)})
         self.assertEqual(often, ["Macro 2", "Macro 1"])
 
     def test_at_most_five_in_each_list(self):
-        often, _ = self.lists({mid: (mid, 5) for mid in range(1, 8)})
+        often, _ = self.lists({mid: (5 + mid, 5) for mid in range(1, 8)})
         self.assertEqual(often, [f"Macro {mid}" for mid in (7, 6, 5, 4, 3)])
         _, kept = self.lists({mid: (0, 4 + mid) for mid in range(1, 8)})
         self.assertEqual(len(kept), 5)
 
     def test_messages_when_empty(self):
         html = render_html(run_audit([use_macro(1, "Fixed text.")], [1], "Fixed text."), "acme")
-        self.assertIn('<p class="muted">No macro has been edited yet.</p>', html)
-        self.assertIn('<p class="muted">Not enough uses yet.</p>', html)
+        self.assertEqual(html.count('<p class="muted">Not enough uses yet.</p>'), 2)
+        html = render_html(run_audits([use_macro(1, "Fixed text.")], macro_uses(1, 0, 5)), "acme")
+        self.assertIn('<p class="muted">No macro was edited in half or more of its uses.</p>', html)
+        html = render_html(run_audits([use_macro(1, "Fixed text.")], macro_uses(1, 5, 0)), "acme")
+        self.assertIn('<p class="muted">No macro was kept intact in most of its uses.</p>', html)
 
     def test_row_text(self):
         macros = [use_macro(1, "Fixed text.")]

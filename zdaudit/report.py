@@ -34,8 +34,10 @@ TIPS = {
     "macro_edit_avg": "How much of the macro was edited, averaged over edited uses. Words removed, changed or "
                       "inserted inside the macro count, as a share of the macro's words. Text added around it doesn't.",
     # Ranked lists
-    "edited_often": "Macros with the highest share of edited uses. A macro agents change this often may need rewriting.",
-    "kept_often": "Macros with the lowest share of edited uses. These work well as written.",
+    "edited_often": "Macros edited in at least half of their compared uses, highest share first. A macro agents "
+                    "change this often may need rewriting.",
+    "kept_often": "Macros kept intact in more than half of their compared uses, highest share first. These work "
+                  "well as written.",
     # Comment type table
     "comment_type": "Whether the agent's text went out as a public reply the customer sees, or as an internal "
                     "note only agents see.",
@@ -250,11 +252,15 @@ def _macro_list(rows: list[dict], empty: str) -> str:
 
 
 def _ranked_macros(macros: list[dict]) -> tuple[list[dict], list[dict]]:
-    """The macros edited most often, and the ones most often kept intact."""
+    """The macros edited in at least half their uses, and the ones kept intact in more than half.
+
+    Splitting at half keeps a mostly edited macro out of the kept list, and a
+    mostly intact one out of the edited list, however few macros there are.
+    """
     eligible = [m for m in macros if m["compared"] >= MIN_USES]
     ranked = sorted(eligible, key=lambda m: (-m["pct_uses_edited"], -m["compared"]))
-    often = [m for m in ranked if m["edited"]][:5]
-    kept = [m for m in reversed(ranked) if m not in often][:5]
+    often = [m for m in ranked if m["pct_uses_edited"] >= 50][:5]
+    kept = [m for m in reversed(ranked) if m["pct_uses_edited"] < 50][:5]
     return often, kept
 
 
@@ -441,6 +447,7 @@ def render_html(result: Result, subdomain: str | None) -> str:
     now = datetime.now().astimezone()
     generated = f"{day(now)} at {now:%H:%M %Z}"
     often, kept = _ranked_macros(result.macros)
+    few = not any(m["compared"] >= MIN_USES for m in result.macros)
 
     # Zendesk's usage counts always cover the last 30 days, and need the Professional plan or above.
     has_usage = any(m["zendesk_usage_30d"] is not None for m in result.macros)
@@ -478,8 +485,8 @@ def render_html(result: Result, subdomain: str | None) -> str:
   <h2>Which macros get edited</h2>
   <p class="muted">Macros with at least {MIN_USES} compared uses. Ones that are often edited may need rewriting.</p>
   <div class="cols">
-    <div class="card"><h3>{tip("Edited most often", "edited_often")}</h3>{_macro_list(often, "No macro has been edited yet.")}</div>
-    <div class="card"><h3>{tip("Kept intact most often", "kept_often")}</h3>{_macro_list(kept, "Not enough uses yet.")}</div>
+    <div class="card"><h3>{tip("Edited most often", "edited_often")}</h3>{_macro_list(often, "Not enough uses yet." if few else "No macro was edited in half or more of its uses.")}</div>
+    <div class="card"><h3>{tip("Kept intact most often", "kept_often")}</h3>{_macro_list(kept, "Not enough uses yet." if few else "No macro was kept intact in most of its uses.")}</div>
   </div>
 
   <h2>Public replies and internal notes</h2>
