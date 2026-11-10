@@ -192,6 +192,13 @@ class AuditJsonTests(unittest.TestCase):
         written.pop("generated_at")
         self.assertEqual(written, EXPECTED)
 
+    def test_word_spans_cover_a_menu_path(self):
+        text = "Update your card in Settings > Billing."
+        result = analyze([make_audit([1], "Update the card in Settings > Billing.")], {"1": use_macro(1, text)},
+                         {}, {}, SINCE, UNTIL)
+        spans = audit_data(result, "acme")["macros"][0]["word_spans"]
+        self.assertEqual([text[s:e] for s, e in spans], text.split())
+
     def test_full_diff_is_never_shortened(self):
         words = [f"word{i}" for i in range(40)]
         result = analyze([make_audit([1], "Something else entirely.")], {"1": use_macro(1, " ".join(words) + ".")},

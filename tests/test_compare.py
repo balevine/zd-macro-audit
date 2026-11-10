@@ -582,6 +582,22 @@ class WordSpanTests(unittest.TestCase):
     def test_liquid_label_has_no_span(self):
         self.assertEqual(self.spans("Hi {% if ticket.id %}there{% endif %} bye."), ["Hi", None, "bye."])
 
+    def test_mid_line_quote_mark_has_a_span(self):
+        text = "You can update your card in Settings > Billing. Click Save."
+        self.assertEqual(self.spans(text), text.split())
+        self.assertEqual(self.spans("Go to Settings &gt; Billing."), ["Go", "to", "Settings", "&gt;", "Billing."])
+
+    def test_mid_line_dashes_have_a_span(self):
+        self.assertEqual(self.spans("Wait --- then click."), ["Wait", "---", "then", "click."])
+
+    def test_real_line_marks_are_left_out(self):
+        text = "Thanks.\n> quoted text > here\n>tight\n---\nBye."
+        self.assertEqual(compile_macro(text).display_words, ["Thanks.", "quoted", "text", ">", "here", "tight", "Bye."])
+        self.assertEqual(self.spans(text), ["Thanks.", "quoted", "text", ">", "here", "tight", "Bye."])
+
+    def test_markup_inside_a_word_has_no_span(self):
+        self.assertEqual(self.spans("Click **Save**. Then [here](url). Done"), ["Click", None, "Then", None, "Done"])
+
 
 if __name__ == "__main__":
     unittest.main()

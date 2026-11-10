@@ -114,11 +114,15 @@ _CLEANUP = (
     (_MD_ESCAPE, True), (_MD_IMAGE, False), (_MD_LINK, True), (_MD_RULE, False),
     (_MD_MARKS, False), (_MD_STAR, True), (_MD_UNDERSCORE, True), (_LINE_MARKS, False),
 )
+# The same steps without the ones that only apply to a whole line. A single word
+# from the middle of a line, like ">" in "Settings > Billing", can't be a quote
+# marker or a horizontal rule, so checking it alone mustn't treat it as one.
+_WORD_CLEANUP = tuple(step for step in _CLEANUP if step[0] not in (_MD_RULE, _LINE_MARKS))
 
 
-def _normalize(text: str) -> str:
+def _normalize(text: str, cleanup: tuple = _CLEANUP) -> str:
     text = html.unescape(text).translate(_CHAR_MAP)
-    for pattern, keep in _CLEANUP:
+    for pattern, keep in cleanup:
         text = pattern.sub(r"\1" if keep else "", text)
     return " ".join(text.split())
 
@@ -395,7 +399,8 @@ def _compile_block(node: _Block, dynamic: dict[str, list[str]], depth: int) -> t
     return [], ""  # {% capture %} and {% comment %} render nothing
 
 
-def _compile_nodes(nodes: list, dynamic: dict[str, list[str]], depth: int) -> tuple[list, str]:
+def _compile_nodes(nodes: list, dynamic: dict[str, list[str]], depth: int,
+                   cleanup: tuple = _CLEANUP) -> tuple[list, str]:
     """Return (parts, display text). Text is normalized as a whole, with slots for the rest."""
     slots: list = []
     joined: list[str] = []
@@ -408,7 +413,7 @@ def _compile_nodes(nodes: list, dynamic: dict[str, list[str]], depth: int) -> tu
 
     parts: list = []
     display: list[str] = []
-    for i, piece in enumerate(_SLOT.split(_normalize("".join(joined)))):
+    for i, piece in enumerate(_SLOT.split(_normalize("".join(joined), cleanup))):
         if i % 2 == 0:
             tokens = tuple(_TOKEN.findall(piece))
             if tokens:
@@ -472,6 +477,7 @@ def _word_spans(text: str, nodes: list, dynamic: dict[str, list[str]], display: 
     A word gets None when cleanup removed markup from inside it, as in
     "**Save**." or "[here](url).", since replacing its span would break that
     markup. It also gets None if its text, cleaned up on its own, isn't the word.
+    That check skips the rules for whole lines, since a word can't be a line marker.
     Returns None for the whole macro if the words or their order don't line up.
     """
     found, sources = _display_sources(nodes, dynamic)
@@ -489,7 +495,7 @@ def _word_spans(text: str, nodes: list, dynamic: dict[str, list[str]], display: 
             return None
         covered = {k for s, e in word_sources for k in range(s, e)}
         removed = any(k not in covered and text[k].translate(_CHAR_MAP) for k in range(start, end))
-        if removed or _compile_nodes(_parse_tree(text[start:end]), {}, 0)[1].split() != [match.group(0)]:
+        if removed or _compile_nodes(_parse_tree(text[start:end]), {}, 0, _WORD_CLEANUP)[1].split() != [match.group(0)]:
             spans.append(None)
             continue
         spans.append([start, end])
