@@ -468,10 +468,6 @@ class FetchMacrosTests(unittest.TestCase):
                             "/api/v2/macros/7.json": {"macro": {"id": 7, "title": "Direct"}}})
         self.assertEqual(zendesk.fetch_macros(fake, ["7"], print)["7"]["title"], "Direct")
 
-    def test_only_wanted_macros_are_kept(self):
-        fake = FakeZendesk({MACRO_PATH + "&include=usage_30d": {"macros": [{"id": 1}, {"id": 2}], "meta": {}}})
-        self.assertEqual(set(zendesk.fetch_macros(fake, ["1"], print)), {"1"})
-
     def test_unexpected_error_on_a_single_macro_stops_the_run(self):
         fake = FakeZendesk({MACRO_PATH + "&include=usage_30d": {"macros": [], "meta": {}}},
                            {"/api/v2/macros/7.json": 400})

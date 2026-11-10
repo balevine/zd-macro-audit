@@ -8,6 +8,15 @@ It looks at the last 30 days of ticket updates in your Zendesk account, up to th
 - **macro_uses.csv**, one row per macro use (who, which macro, public or internal, edited or not, percent of the macro edited)
 - **macros.csv**, totals per macro
 - **agents.csv**, totals per agent
+- **audit.json**, everything above in one file for other tools to read
+
+### audit.json
+
+`audit.json` is for tools that suggest changes to macros, list unused macros to delete, or remove personal details before sending text anywhere else. It lists every macro in the account, including inactive and personal ones and those nobody used, with its full text. It also lists every use with the full set of changes the agent made, and the names and emails of the agents and the customers who asked for help on those tickets.
+
+**It contains personal data**, such as customer names, emails, and the text of replies. Only your user account on this computer can open it. Don't share it or upload it anywhere until those details are removed.
+
+In a diff, `op` is `equal`, `delete`, `insert`, or `macro`. A `macro` step is the text of another macro applied in the same update, named by `macro_id`. Words are joined by single spaces, so line breaks aren't kept.
 
 The report covers:
 
@@ -135,12 +144,12 @@ All requests are read-only.
 
 | Endpoint | What it's for |
 | --- | --- |
-| `GET /api/v2/incremental/tickets/cursor` | Lists every ticket updated in the period. |
+| `GET /api/v2/incremental/tickets/cursor` | Lists every ticket updated in the period, and who asked for help on each. |
 | `GET /api/v2/tickets/{id}/audits` | Each ticket's history. A "macro reference" event shows a macro was applied, and the "comment" event in the same update shows what was sent. |
-| `GET /api/v2/macros?include=usage_30d` | The text of each macro, plus Zendesk's own 30-day usage count. |
+| `GET /api/v2/macros?include=usage_30d` | Every macro, active or not, with its text and Zendesk's own 30-day usage count. For an admin this includes agents' personal macros. |
 | `GET /api/v2/macros/{id}` | Tries to get macros that are missing from the list. |
 | `GET /api/v2/dynamic_content/items` | Expands `{{dc.*}}` placeholders. Only called if a macro uses one. |
-| `GET /api/v2/users/show_many` | Agent names and emails. |
+| `GET /api/v2/users/show_many` | Names and emails of agents, and of the customers who asked for help on tickets where a macro was used. |
 
 Zendesk's usage count is a check on the tool. In the report's macro table, "Zendesk count" should be close to "Uses". A big gap means the tool missed some uses. The count needs the Support Professional plan or higher. On other plans the column is left out.
 
@@ -216,7 +225,7 @@ Some uses can't be judged, so they're left out of the percentages and listed sep
 - With OAuth, the tool asks Zendesk for **read** access only. Your sign-in and the OAuth secret are saved in the macOS keychain, under `zd-macro-audit`, and never in this folder. Run with `--sign-out` to remove them. To cut off access completely, delete the OAuth client in Admin Center.
 - An API token can't be limited to reading. It has the full rights of the admin who owns it, so anyone holding it can read and change everything that admin can. The tool itself only reads. Where you can, use OAuth instead, since it only gets read access. The tool saves the token in the macOS keychain, and `--sign-out` removes it. To cut off access, delete the token in Admin Center.
 - The keychain keeps secrets encrypted and out of this folder, so they don't travel with a zip, a backup or a shared folder. It doesn't protect against other programs running under your account, which can ask the `security` command for them.
-- The report contains text from ticket comments, both public replies to customers and internal notes, which can include customer details. The report and CSVs contain agent names and emails. Treat them as sensitive, and check before you forward them or upload them anywhere.
+- The report contains text from ticket comments, both public replies to customers and internal notes, which can include customer details. The report and CSVs contain agent names and emails. `audit.json` also contains customer names and emails. Treat them as sensitive, and check before you forward them or upload them anywhere.
 
 ## Files
 

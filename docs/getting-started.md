@@ -84,7 +84,7 @@ The tool then prints its progress and a summary that ends like this:
 
 ```
 Report: /Users/you/zd-macro-audit/reports/2026-11-07_101500/report.html
-CSVs:   /Users/you/zd-macro-audit/reports/2026-11-07_101500
+Files:  /Users/you/zd-macro-audit/reports/2026-11-07_101500
 ```
 
 If you see "Network error … Retrying", Zendesk was slow to answer. The tool waits up to 2 minutes for each request, then tries again on its own, so let it keep going.

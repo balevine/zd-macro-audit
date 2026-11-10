@@ -526,7 +526,7 @@ class CsvTests(unittest.TestCase):
             paths = write_all(Path(folder) / "new" / "folder", result, subdomain)
             self.assertTrue(paths["report"].read_text(encoding="utf-8").startswith("<!doctype html>"))
             return {name: list(csv.DictReader(path.read_text(encoding="utf-8").splitlines()))
-                    for name, path in paths.items() if name != "report"}
+                    for name, path in paths.items() if name not in ("report", "audit")}
 
     def test_uses(self):
         users = {"7": {"name": "Ana", "email": "ana@example.com"}}

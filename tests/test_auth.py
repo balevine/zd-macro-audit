@@ -448,7 +448,7 @@ class RequestTests(OAuthTestCase):
         since = datetime(2026, 10, 1, tzinfo=timezone.utc)
         with mock.patch("urllib.request.urlopen", side_effect=[reply(first), reply({"tickets": []})]) as urlopen:
             with self.assertRaises(ZendeskError) as caught:
-                zendesk.fetch_updated_ticket_ids(self.zd, since, lambda _: None)
+                zendesk.fetch_updated_tickets(self.zd, since, lambda _: None)
         self.assertEqual(str(caught.exception), refused("https://evil.com"))
         self.assertEqual([c[0][0].full_url for c in urlopen.call_args_list],
                          [f"https://acme.zendesk.com/api/v2/incremental/tickets/cursor?start_time={int(since.timestamp())}"])

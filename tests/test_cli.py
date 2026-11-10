@@ -252,14 +252,15 @@ class RunTests(TempFolderTest):
         code, out, _ = self.run_main("--sample")
         self.assertEqual(code, 0)
         folder = next((self.dir / "reports").iterdir())
-        self.assertEqual({p.name for p in folder.iterdir()}, {"report.html", "macro_uses.csv", "macros.csv", "agents.csv"})
+        self.assertEqual({p.name for p in folder.iterdir()}, {"report.html", "macro_uses.csv", "macros.csv", "agents.csv",
+                                                           "audit.json"})
         self.assertIn("Sample data", (folder / "report.html").read_text(encoding="utf-8"))
-        self.assertRegex(out, r"Macro uses found:\s+447 \(8 macros\)")
+        self.assertRegex(out, r"Macro uses found:\s+473 \(9 macros\)")
         self.assertRegex(out, r"Kept intact:\s+\d+ \(\d+%\), \d+ with text added around it")
         self.assertRegex(out, r"Public:\s+\d+ of \d+ edited \(\d+%\)")
         self.assertRegex(out, r"No comment:\s+\d+ of \d+ edited")
         self.assertRegex(out, r"Not compared:\s+\d+")
-        self.assertIn(f"Report: {folder / 'report.html'}", out)
+        self.assertIn(f"Report: {folder / 'report.html'}\nFiles:  {folder}\n", out)
 
     def test_days_sets_the_period(self):
         with mock.patch.object(zd_macro_audit.analyze, "analyze", wraps=zd_macro_audit.analyze.analyze) as run:

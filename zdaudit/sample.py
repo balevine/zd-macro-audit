@@ -3,6 +3,10 @@
 The data has the same shape as what the Zendesk API returns, and it covers
 the tricky cases: placeholders, dynamic content, internal notes, several
 macros in one update, a deleted macro, and a macro edited mid-period.
+
+For audit.json it also has unused macros (old, new, inactive and personal),
+a macro restricted to a group, and a macro agents usually rewrite the same
+way, with a greeting that names the requester.
 """
 from __future__ import annotations
 
@@ -25,6 +29,9 @@ AGENTS = [
 ]
 
 REQUESTERS = ["Sam", "Priya", "Jordan", "Lena", "Marco", "Aiko", "Tom", "Grace"]
+SURNAMES = ["Lee", "Nair", "Blake", "Fischer", "Rossi", "Tanaka", "Byrne", "Osei"]
+# Requesters on the tickets where agents rewrite "Order shipped" and greet them by name.
+SHIPPED_REQUESTERS = [(3101, "Dana Whitfield"), (3102, "Omar Haddad"), (3103, "Ines Castillo")]
 
 DYNAMIC = {
     "dc.sign_off": [
@@ -51,9 +58,20 @@ USAGE = {2001: (30, 0.6), 2002: (18, 1.0), 2003: (12, 0.3), 2004: (10, 0), 2005:
          2006: (15, 0.5), 2007: (8, 1.8), 2099: (3, 1.0)}
 
 
-def _macros(old: str, changed: str) -> dict[str, dict]:
-    def macro(mid, title, actions, updated=old):
-        return {"id": mid, "title": title, "actions": actions, "updated_at": updated}
+SHIPPED = ("Your order has shipped and is on its way. You can track it with the link in your "
+           "confirmation email.")
+# What agents usually add inside "Order shipped". Each says much the same thing.
+SHIPPED_ADDITIONS = [
+    "It should arrive within 2 business days.",
+    "It should arrive in about 2 business days.",
+    "It should be with you within 2 business days.",
+]
+
+
+def _macros(old: str, changed: str, recent: str) -> dict[str, dict]:
+    def macro(mid, title, actions, updated=old, created=old, active=True, restriction=None):
+        return {"id": mid, "title": title, "actions": actions, "created_at": created, "updated_at": updated,
+                "active": active, "restriction": restriction}
 
     items = [
         macro(2001, "Password reset steps", [{"field": "comment_value_html", "value":
@@ -67,7 +85,7 @@ def _macros(old: str, changed: str) -> dict[str, dict]:
             {"field": "comment_value", "value":
                 "Escalating to billing. The customer reports a double charge. Please check the payment log."},
             {"field": "comment_mode_is_public", "value": "false"},
-            {"field": "group_id", "value": "360001"}]),
+            {"field": "group_id", "value": "360001"}], restriction={"type": "Group", "id": 360001, "ids": [360001]}),
         macro(2004, "Set priority to urgent", [{"field": "priority", "value": "urgent"}]),
         macro(2005, "Shipping delay apology", [{"field": "comment_value", "value":
             "Hi {{ticket.requester.first_name}},\n\nSorry your order is running late. Our carrier is "
@@ -79,6 +97,18 @@ def _macros(old: str, changed: str) -> dict[str, dict]:
         macro(2007, "Ask for a screenshot", [{"field": "comment_value", "value":
             "Hi {{ticket.requester.first_name}},\n\nCould you send a screenshot of what you're seeing? "
             "It helps us find the problem faster.{% if ticket.requester.language == 'English' %} Thanks!{% endif %}"}]),
+        macro(2008, "Order shipped", [{"field": "comment_value", "value": SHIPPED}]),
+        # Never used in the period.
+        macro(2009, "Warranty claim steps", [{"field": "comment_value", "value":
+            "To start a warranty claim, reply with your order number and a photo of the problem."}]),
+        macro(2010, "New returns portal", [{"field": "comment_value", "value":
+            "You can now start a return yourself from the returns page in your account."}],
+            updated=recent, created=recent),
+        macro(2011, "Dev's refund note", [{"field": "comment_value", "value":
+            "Refund checked against the payment log. Nothing else needed."}],
+            restriction={"type": "User", "id": 1004}),
+        macro(2012, "Holiday hours 2024", [{"field": "comment_value", "value":
+            "Our office is closed from December 24 to January 1."}], active=False),
     ]
     return {str(m["id"]): m for m in items}
 
@@ -97,9 +127,12 @@ def generate(since: datetime, until: datetime, seed: int = 7, count: int = 420) 
     rng = random.Random(seed)
     stamp = lambda d: d.strftime("%Y-%m-%dT%H:%M:%SZ")
     changed_at = since + (until - since) * 0.4
-    macros = _macros(stamp(since - timedelta(days=90)), stamp(changed_at))
+    macros = _macros(stamp(since - timedelta(days=90)), stamp(changed_at), stamp(until - timedelta(days=5)))
     ids, weights = list(USAGE), [w for w, _ in USAGE.values()]
     audits = []
+    requesters: dict[int, int] = {}  # ticket ID -> requester ID
+    requester_ids = {name: 3001 + i for i, name in enumerate(REQUESTERS)}
+    ticket_names: dict[int, str] = {}
 
     for n in range(count):
         created = since + timedelta(seconds=rng.uniform(0, (until - since).total_seconds()))
@@ -121,7 +154,9 @@ def generate(since: datetime, until: datetime, seed: int = 7, count: int = 420) 
                 if action:
                     texts.append(action["value"])
 
-        requester = rng.choice(REQUESTERS)
+        # Each ticket has one requester, so a later use on the same ticket keeps the first one's name.
+        requester = ticket_names.setdefault(ticket_id, rng.choice(REQUESTERS))
+        requesters[ticket_id] = requester_ids[requester]
         body = "\n\n".join(_render(t, requester, agent, ticket_id, rng) for t in texts)
         factor = max(USAGE[mid][1] for mid in refs)
         if body and rng.random() < edit_rate * factor:
@@ -140,10 +175,50 @@ def generate(since: datetime, until: datetime, seed: int = 7, count: int = 420) 
         audits.append({"id": 9_000_000 + n, "ticket_id": ticket_id, "created_at": stamp(created),
                        "author_id": agent_id, "events": events})
 
-    # Zendesk's own counts include a few uses on tickets we didn't read.
+    audits += _shipped_audits(since, until, len(audits), requesters, random.Random(seed + 1))
+
+    # Zendesk's own counts include a few uses on tickets we didn't read. Unused macros stay at 0.
     used = Counter(str(e["macro_id"]) for a in audits for e in a["events"] if "macro_id" in e)
     for mid, macro in macros.items():
-        macro["usage_30d"] = used[mid] + rng.randrange(3)
+        macro["usage_30d"] = used[mid] + rng.randrange(3) if used[mid] else 0
 
     users = {str(a[0]): {"id": a[0], "name": a[1], "email": a[2], "role": "agent"} for a in AGENTS}
-    return {"audits": audits, "macros": macros, "users": users, "dynamic": DYNAMIC}
+    people = [(rid, f"{name} {SURNAMES[i]}") for i, (name, rid) in enumerate(requester_ids.items())]
+    for rid, name in people + SHIPPED_REQUESTERS:
+        email = name.lower().replace(" ", ".") + "@example.net"
+        users[str(rid)] = {"id": rid, "name": name, "email": email, "role": "end-user"}
+    return {"audits": audits, "macros": macros, "users": users, "dynamic": DYNAMIC,
+            "requesters": {tid: str(rid) for tid, rid in requesters.items()}}
+
+
+def _shipped_audits(since: datetime, until: datetime, first: int, requesters: dict[int, int],
+                    rng: random.Random) -> list[dict]:
+    """Uses of "Order shipped". Agents greet the requester by name, and most add a delivery estimate inside it.
+
+    The last two also apply "Closing, no response", whose greeting comes first.
+    This has its own random numbers, so the rest of the sample stays the same.
+    """
+    stamp = lambda d: d.strftime("%Y-%m-%dT%H:%M:%SZ")
+    agents = [a for a in AGENTS if a[3] > 0]  # Erin never edits
+    audits = []
+    for n in range(24):
+        created = since + timedelta(seconds=rng.uniform(0, (until - since).total_seconds()))
+        agent_id, agent = rng.choice(agents)[:2]
+        ticket_id = 54000 + n
+        requester_id, requester = rng.choice(SHIPPED_REQUESTERS)
+        requesters[ticket_id] = requester_id
+        first_name = requester.split()[0]
+        body = SHIPPED
+        if n % 4:  # three uses in four are edited
+            body = body.replace("on its way. ", f"on its way. {rng.choice(SHIPPED_ADDITIONS)} ")
+        events = [{"type": "MacroReference", "macro_id": 2008, "macro_title": "Order shipped"}]
+        if n >= 22:
+            body = (f"Hi {first_name},\n\nWe haven't heard back, so we're closing this ticket for now. Just reply "
+                    f"to this email if you still need help and it will reopen.\n\n{body}")
+            events.append({"type": "MacroReference", "macro_id": 2006, "macro_title": "Closing, no response"})
+        else:
+            body = f"Hi {first_name},\n\n{body}"
+        events.append({"type": "Comment", "body": f"{body}\n\nThanks,\n{agent.split()[0]}", "public": True})
+        audits.append({"id": 9_000_000 + first + n, "ticket_id": ticket_id, "created_at": stamp(created),
+                       "author_id": agent_id, "events": events})
+    return audits
