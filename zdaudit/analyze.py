@@ -61,6 +61,7 @@ class Result:
     macros: list[dict]
     coverage: Coverage = field(default_factory=Coverage)
     all_macros: dict[str, dict] = field(default_factory=dict)  # every macro fetched, used or not
+    word_spans: dict[str, list | None] = field(default_factory=dict)  # per compared macro, see compile_macro
 
 
 def macro_text(macro: dict) -> str | None:
@@ -162,7 +163,7 @@ def analyze(audits: list[dict], macros: dict[str, dict], users: dict[str, dict],
             ))
 
     return Result(since, until, uses, users, _overall(uses), _by_agent(uses, users), _by_macro(uses, macros),
-                  coverage or Coverage(), macros)
+                  coverage or Coverage(), macros, {mid: m.word_spans for mid, m in compiled.items()})
 
 
 def _name_other_macros(diff: list[tuple[str, list[str]]] | None, compared: list[str],

@@ -68,6 +68,8 @@ _CHAR_MAP = str.maketrans({
     "\xa0": " ",
     "​": "", "‌": "", "‍": "", "⁠": "", "﻿": "", "\xad": "",
 })
+# The entities html.unescape replaces, as the standard library finds them.
+_ENTITY = re.compile(r"&(#[0-9]+;?|#[xX][0-9a-fA-F]+;?|[^\t\n\f <&#;]{1,32};?)")
 _MD_ESCAPE = re.compile(r"\\([\\`*_{}\[\]()#+.!>-])")
 _MD_IMAGE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
 _MD_LINK = re.compile(r"\[([^\]]*)\]\([^)]*\)")
@@ -107,17 +109,71 @@ def html_to_text(markup: str) -> str:
     return "".join(parser.parts)
 
 
+# Cleanup steps in order. Each removes its match, or keeps only the match's first group.
+_CLEANUP = (
+    (_MD_ESCAPE, True), (_MD_IMAGE, False), (_MD_LINK, True), (_MD_RULE, False),
+    (_MD_MARKS, False), (_MD_STAR, True), (_MD_UNDERSCORE, True), (_LINE_MARKS, False),
+)
+
+
 def _normalize(text: str) -> str:
     text = html.unescape(text).translate(_CHAR_MAP)
-    text = _MD_ESCAPE.sub(r"\1", text)
-    text = _MD_IMAGE.sub("", text)
-    text = _MD_LINK.sub(r"\1", text)
-    text = _MD_RULE.sub("", text)
-    text = _MD_MARKS.sub("", text)
-    text = _MD_STAR.sub(r"\1", text)
-    text = _MD_UNDERSCORE.sub(r"\1", text)
-    text = _LINE_MARKS.sub("", text)
+    for pattern, keep in _CLEANUP:
+        text = pattern.sub(r"\1" if keep else "", text)
     return " ".join(text.split())
+
+
+def _normalize_tracked(text: str, sources: list) -> tuple[str, list]:
+    """The same as _normalize, but also says where each character of the result came from.
+
+    `sources` has one entry per character of `text`, as (start, end) in the
+    macro's text, or None when the character has no source there.
+    """
+    out, out_sources, position = [], [], 0
+    for match in _ENTITY.finditer(text):
+        out.append(text[position:match.start()])
+        out_sources.extend(sources[position:match.start()])
+        original, replaced = match.group(0), html.unescape(match.group(0))
+        # Text after the entity, as in "&ampx" or "&notreal", is unchanged and keeps its own sources.
+        same = 0
+        while same < min(len(original), len(replaced)) and original[-1 - same] == replaced[-1 - same]:
+            same += 1
+        changed_end = match.end() - same
+        found = [s for s in sources[match.start():changed_end] if s]
+        source = (found[0][0], found[-1][1]) if found else None
+        out.append(replaced)
+        out_sources.extend([source] * (len(replaced) - same))
+        out_sources.extend(sources[changed_end:match.end()])
+        position = match.end()
+    out.append(text[position:])
+    out_sources.extend(sources[position:])
+    text, sources = "".join(out), out_sources
+
+    kept = [(c.translate(_CHAR_MAP), s) for c, s in zip(text, sources)]
+    text, sources = "".join(c for c, _ in kept), [s for c, s in kept for _ in c]
+
+    for pattern, keep in _CLEANUP:
+        out, out_sources, position = [], [], 0
+        for match in pattern.finditer(text):
+            out.append(text[position:match.start()])
+            out_sources.extend(sources[position:match.start()])
+            if keep:
+                start, end = match.span(1)
+                out.append(text[start:end])
+                out_sources.extend(sources[start:end])
+            position = match.end()
+        out.append(text[position:])
+        out_sources.extend(sources[position:])
+        text, sources = "".join(out), out_sources
+
+    out, out_sources = [], []
+    for match in re.finditer(r"\S+", text):
+        if out:
+            out.append(" ")
+            out_sources.append(None)
+        out.append(match.group(0))
+        out_sources.extend(sources[match.start():match.end()])
+    return "".join(out), out_sources
 
 
 def _is_word(token: str) -> bool:
@@ -245,9 +301,21 @@ def _sequence_ends(parts: list, comment: _Comment, start: int) -> set[int]:
 
 # ---- Reading a macro's text ----------------------------------------------------
 
+class _Text(str):
+    """Plain text from a macro, with where it starts in the macro's text."""
+    start = 0
+
+
+def _text(text: str, start: int) -> _Text:
+    piece = _Text(text)
+    piece.start = start
+    return piece
+
+
 @dataclass
 class _Placeholder:
     source: str
+    start: int = 0
 
 
 @dataclass
@@ -264,11 +332,11 @@ def _parse_tree(text: str) -> list:
     stack: list[tuple[_Block, list]] = []
     position = 0
     for match in _TAG.finditer(text):
-        current.append(text[position:match.start()])
+        current.append(_text(text[position:match.start()], position))
         position = match.end()
         source = match.group(0)
         if source.startswith("{{"):
-            current.append(_Placeholder(source))
+            current.append(_Placeholder(source, match.start()))
             continue
         name_match = _TAG_NAME.match(source)
         name = name_match.group(1) if name_match else ""
@@ -287,7 +355,7 @@ def _parse_tree(text: str) -> list:
                 block, current = stack.pop()
                 if block.tag == name[3:]:
                     break
-    current.append(text[position:])
+    current.append(_text(text[position:], position))
     return root
 
 
@@ -355,6 +423,80 @@ def _compile_nodes(nodes: list, dynamic: dict[str, list[str]], depth: int) -> tu
     return parts, "".join(display)
 
 
+def _display_sources(nodes: list, dynamic: dict[str, list[str]]) -> tuple[str, list]:
+    """The display text of top-level nodes, and where each of its characters came from.
+
+    Placeholders map to their whole source. Liquid block labels and expanded
+    dynamic content have no single source, so they map to None.
+    """
+    joined: list[str] = []
+    sources: list = []
+    slots: list = []
+    for node in nodes:
+        if isinstance(node, str):
+            joined.append(node)
+            sources.extend((node.start + k, node.start + k + 1) for k in range(len(node)))
+        else:
+            marker = f"\x00{len(slots)}\x00"
+            joined.append(marker)
+            sources.extend([None] * len(marker))
+            slots.append(node)
+    text, sources = _normalize_tracked("".join(joined), sources)
+
+    display: list[str] = []
+    display_sources: list = []
+    position = 0
+    for match in list(_SLOT.finditer(text)) + [None]:
+        end = match.start() if match else len(text)
+        display.append(text[position:end])
+        display_sources.extend(sources[position:end])
+        if match is None:
+            break
+        position = match.end()
+        node = slots[int(match.group(1))]
+        if isinstance(node, _Placeholder):
+            piece = _compile_placeholder(node, dynamic, 0)[1]
+            name = _placeholder_name(node.source)
+            expanded = name.startswith("dc.") and dynamic.get(name)
+            source = None if expanded else (node.start, node.start + len(node.source))
+        else:
+            piece, source = _compile_block(node, dynamic, 0)[1], None
+        display.append(piece)
+        display_sources.extend([source] * len(piece))
+    return "".join(display), display_sources
+
+
+def _word_spans(text: str, nodes: list, dynamic: dict[str, list[str]], display: str) -> list | None:
+    """Where each display word came from in the macro's text, as [start, end] or None.
+
+    A word gets None when cleanup removed markup from inside it, as in
+    "**Save**." or "[here](url).", since replacing its span would break that
+    markup. It also gets None if its text, cleaned up on its own, isn't the word.
+    Returns None for the whole macro if the words or their order don't line up.
+    """
+    found, sources = _display_sources(nodes, dynamic)
+    if found != display:
+        return None
+    spans: list = []
+    last_end = 0
+    for match in re.finditer(r"\S+", display):
+        word_sources = sources[match.start():match.end()]
+        if None in word_sources:
+            spans.append(None)
+            continue
+        start, end = min(s for s, _ in word_sources), max(e for _, e in word_sources)
+        if start < last_end:
+            return None
+        covered = {k for s, e in word_sources for k in range(s, e)}
+        removed = any(k not in covered and text[k].translate(_CHAR_MAP) for k in range(start, end))
+        if removed or _compile_nodes(_parse_tree(text[start:end]), {}, 0)[1].split() != [match.group(0)]:
+            spans.append(None)
+            continue
+        spans.append([start, end])
+        last_end = end
+    return spans if len(spans) == len(display.split()) else None
+
+
 def _required_words(parts: list) -> int:
     """How many fixed words must appear, whichever options are taken."""
     total = 0
@@ -373,10 +515,12 @@ class Macro:
     trail_words: int           # words the placeholders after the core can fill
     display_words: list[str]   # macro words with placeholders kept, for diffs
     comparable: bool           # False when nothing but placeholders is certain, so any comment could match
+    word_spans: list | None = None  # where each display word came from in the text, see _word_spans
 
 
 def compile_macro(text: str, dynamic: dict[str, list[str]] | None = None) -> Macro:
-    parts, display = _compile_nodes(_parse_tree(text), dynamic or {}, 0)
+    nodes = _parse_tree(text)
+    parts, display = _compile_nodes(nodes, dynamic or {}, 0)
     first = next((i for i, part in enumerate(parts) if not isinstance(part, _Gap)), len(parts))
     last = next((i for i in range(len(parts), first, -1) if not isinstance(parts[i - 1], _Gap)), first)
     return Macro(
@@ -385,6 +529,7 @@ def compile_macro(text: str, dynamic: dict[str, list[str]] | None = None) -> Mac
         sum(part.max_words for part in parts[last:]),
         display.split(),
         _required_words(parts) > 0,
+        _word_spans(text, nodes, dynamic or {}, display),
     )
 
 

@@ -208,6 +208,7 @@ def _audit_macros(result: Result) -> list[dict]:
     stats = {row["macro_id"]: row for row in result.macros}
     # Macros known only from uses were deleted, or this sign-in can't read them.
     gone = {u.macro_id: u.macro_title for u in result.uses if u.macro_id not in result.all_macros}
+    used = {u.macro_id for u in result.uses}
     rows = []
     for mid in sorted({*result.all_macros, *gone}, key=lambda m: (_id(m) is None, _id(m) or 0, m)):
         row = stats.get(mid, {})
@@ -224,6 +225,7 @@ def _audit_macros(result: Result) -> list[dict]:
                 "created_at": macro.get("created_at"), "updated_at": macro.get("updated_at"),
                 "usage_30d": macro.get("usage_30d"), "text": macro_text(macro), "deleted": False,
             }
+        info["word_spans"] = result.word_spans.get(mid) if mid in used else None
         rows.append({**info, **{key: row.get(key, empty) for key, empty in MACRO_STATS.items()}})
     return rows
 

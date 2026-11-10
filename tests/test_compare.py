@@ -569,5 +569,19 @@ class IsPlaceholderTests(unittest.TestCase):
         self.assertFalse(is_placeholder("{word}"))
 
 
+class WordSpanTests(unittest.TestCase):
+    def spans(self, text):
+        macro = compile_macro(text)
+        return [None if s is None else text[s[0]:s[1]] for s in macro.word_spans]
+
+    def test_spans_cover_the_original_characters(self):
+        text = "Hi {{ ticket.id }},\n1. Click “Save”\n2. Wait"
+        self.assertEqual(compile_macro(text).display_words, ["Hi", "{{ticket.id}},", "Click", '"Save"', "Wait"])
+        self.assertEqual(self.spans(text), ["Hi", "{{ ticket.id }},", "Click", "“Save”", "Wait"])
+
+    def test_liquid_label_has_no_span(self):
+        self.assertEqual(self.spans("Hi {% if ticket.id %}there{% endif %} bye."), ["Hi", None, "bye."])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -18,6 +18,8 @@ It looks at the last 30 days of ticket updates in your Zendesk account, up to th
 
 In a diff, `op` is `equal`, `delete`, `insert`, or `macro`. A `macro` step is the text of another macro applied in the same update, named by `macro_id`. Words are joined by single spaces, so line breaks aren't kept.
 
+Diff words come from a cleaned-up copy of the macro's text, so they don't always match `text` exactly. To find them in `text`, each macro has `word_spans`, with one `[start, end]` per word in its `equal` and `delete` steps, in order. These are Python string positions in `text`, with the end left out. An entry is `null` when the word has no single place in `text`, such as a Liquid block like `{%if…%}` or words from dynamic content. The whole field is `null` for macros with no text, macros not used in the period, and macros whose words couldn't be matched to `text` reliably.
+
 The report covers:
 
 - the percentage of macro uses sent edited and kept intact
