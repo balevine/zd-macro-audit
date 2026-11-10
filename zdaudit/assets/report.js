@@ -61,8 +61,11 @@
     var x = a.pct === null ? -1 : a.pct, y = b.pct === null ? -1 : b.pct;
     return y - x || (a.when < b.when ? 1 : a.when > b.when ? -1 : 0);
   }
+  // Sorting is stable, so each agent's uses stay newest first.
+  function byAgent(a, b) { return a.agent.localeCompare(b.agent); }
   function ordered(list, order) {
     if (order === 'most') return list.slice().sort(mostEdited);
+    if (order === 'agent') return list.slice().sort(byAgent);
     if (order === 'old') return list.slice().reverse();
     return list;  // the data is newest first
   }
@@ -91,19 +94,29 @@
   // Every macro use
   var q = document.getElementById('q'), st = document.getElementById('status'),
       ty = document.getElementById('type'), order = document.getElementById('order'),
-      count = document.getElementById('count');
+      count = document.getElementById('count'), ag = document.getElementById('agent');
+  // One choice per agent, A to Z, with how many uses each has.
+  var perAgent = {};
+  uses.forEach(function (u) { perAgent[u.agent] = (perAgent[u.agent] || 0) + 1; });
+  Object.keys(perAgent).sort(function (a, b) { return a.localeCompare(b); }).forEach(function (name) {
+    var option = document.createElement('option');
+    option.value = name;
+    option.textContent = name + ' (' + perAgent[name].toLocaleString() + ')';
+    ag.appendChild(option);
+  });
   var searchable = uses.map(function (u) { return (u.agent + ' ' + u.title + ' ' + u.ticket).toLowerCase(); });
   var showAll = pager(document.querySelector('#uses tbody'), document.getElementById('more'), true);
   function apply() {
     var term = q.value.trim().toLowerCase();
     var list = uses.filter(function (u, i) {
-      return (!st.value || u.status === st.value) && (!ty.value || u.type === ty.value) &&
+      return (!ag.value || u.agent === ag.value) &&
+             (!st.value || u.status === st.value) && (!ty.value || u.type === ty.value) &&
              (!term || searchable[i].indexOf(term) !== -1);
     });
     count.textContent = usesOf(list.length, uses.length);
     showAll(ordered(list, order.value));
   }
-  [q, st, ty, order].forEach(function (el) { el.addEventListener('input', apply); });
+  [q, ag, st, ty, order].forEach(function (el) { el.addEventListener('input', apply); });
   apply();
 
   // A macro's own uses, drawn when its row is first opened

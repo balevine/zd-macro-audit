@@ -145,6 +145,11 @@ class PageDataTests(unittest.TestCase):
         data = page_data(render_html(run_audit([use_macro(1, "First part.")], [1], "First part."), None))
         self.assertEqual(data["uses"][0]["url"], "")
 
+    def test_uses_can_be_filtered_and_sorted_by_agent(self):
+        html = render_html(run_audit([use_macro(1, "First part.")], [1], "First part."), "acme")
+        self.assertIn('<select id="agent" aria-label="Agent"><option value="">All agents</option></select>', html)
+        self.assertIn('<option value="agent">Agent (A to Z)</option>', html)
+
     def test_every_status_has_a_label_and_tip(self):
         data = page_data(render_html(run_audit([], [1], "x"), "acme"))
         self.assertEqual(set(data["labels"]), set(data["tips"]))
