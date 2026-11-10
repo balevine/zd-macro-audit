@@ -520,10 +520,12 @@ def render_html(result: Result, subdomain: str | None) -> str:
   <p class="muted">Click an "Edited" badge to see what changed. Struck-out text was in the macro but not sent. Highlighted text was added by the agent. Underlined text is a placeholder Zendesk filled in. A macro name in [brackets] shows where another macro applied in the same update went.</p>
   <div class="filters">
     <input id="q" type="search" placeholder="Search agent, macro or ticket number">
+    <select id="agent" aria-label="Agent"><option value="">All agents</option></select>
     <select id="status"><option value="">All results</option>{status_options}</select>
     <select id="type"><option value="">All comment types</option><option value="public">Public</option>
       <option value="internal">Internal</option><option value="none">No comment</option></select>
-    <select id="order"><option value="new">Newest first</option><option value="most">Most edited first</option></select>
+    <select id="order"><option value="new">Newest first</option><option value="most">Most edited first</option>
+      <option value="agent">Agent (A to Z)</option></select>
     <span id="count"></span>
   </div>
   <div class="tablewrap"><table id="uses">
