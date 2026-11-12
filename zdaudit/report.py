@@ -3,12 +3,20 @@ from __future__ import annotations
 
 import csv
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
 
-from .analyze import COUNTED, STATUS_HELP, STATUS_LABELS, Result, agent_name
+from .analyze import COUNTED, STATUS_HELP, STATUS_LABELS, Result, Use, agent_name, macro_text
 from .compare import is_placeholder
+from .zendesk import write_private
+
+# Bump when a field in audit.json is renamed, removed or changes meaning.
+AUDIT_SCHEMA_VERSION = 1
+
+# Per-macro totals copied into audit.json, with what an unused macro gets.
+MACRO_STATS = {"uses": 0, "compared": 0, "edited": 0, "unedited": 0, "pct_uses_edited": None,
+               "avg_pct_of_macro": None, "avg_pct_of_macro_when_edited": None, "public": 0, "internal": 0}
 
 # A macro needs at least this many compared uses to appear in the
 # "often edited" and "usually kept intact" lists.
@@ -117,6 +125,7 @@ def write_all(out_dir: Path, result: Result, subdomain: str | None) -> dict[str,
         "uses": out_dir / "macro_uses.csv",
         "macros": out_dir / "macros.csv",
         "agents": out_dir / "agents.csv",
+        "audit": out_dir / "audit.json",
     }
     _write_uses_csv(paths["uses"], result, subdomain)
     _write_rows_csv(paths["macros"], result.macros, [
@@ -133,6 +142,8 @@ def write_all(out_dir: Path, result: Result, subdomain: str | None) -> dict[str,
             writer.writerow(["ticket_id", "ticket_url"])
             writer.writerows([t, ticket_url(subdomain, t)] for t in result.coverage.unread)
     paths["report"].write_text(render_html(result, subdomain), encoding="utf-8")
+    # It holds customer names, emails and reply text, so only the owner can read it.
+    write_private(paths["audit"], json.dumps(audit_data(result, subdomain), indent=2, ensure_ascii=False) + "\n")
     return paths
 
 
@@ -170,6 +181,111 @@ def _write_rows_csv(path: Path, rows: list[dict], columns: list[str]) -> None:
         writer.writeheader()
         for row in rows:
             writer.writerow({k: "" if row.get(k) is None else row.get(k) for k in columns})
+
+
+# ---- audit.json ----------------------------------------------------------------
+
+def _time(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+def _id(value) -> int | None:
+    """A Zendesk ID as a number, or None when it's missing."""
+    text = str(value)
+    return int(text) if text.isdigit() else None
+
+
+def _restriction(macro: dict) -> dict | None:
+    """Who can use the macro, as {"type": "Group" or "User", "ids": [...]}, or None for everyone."""
+    found = macro.get("restriction")
+    if not found:
+        return None
+    ids = found.get("ids") or ([found["id"]] if found.get("id") is not None else [])
+    return {"type": found.get("type"), "ids": ids}
+
+
+def _audit_macros(result: Result) -> list[dict]:
+    stats = {row["macro_id"]: row for row in result.macros}
+    # Macros known only from uses were deleted, or this sign-in can't read them.
+    gone = {u.macro_id: u.macro_title for u in result.uses if u.macro_id not in result.all_macros}
+    used = {u.macro_id for u in result.uses}
+    rows = []
+    for mid in sorted({*result.all_macros, *gone}, key=lambda m: (_id(m) is None, _id(m) or 0, m)):
+        row = stats.get(mid, {})
+        macro = result.all_macros.get(mid)
+        if macro is None:
+            info = {"id": _id(mid), "title": gone[mid], "active": None, "restriction": None, "shared": None,
+                    "created_at": None, "updated_at": None, "usage_30d": None, "text": None, "deleted": True}
+        else:
+            restriction = _restriction(macro)
+            info = {
+                "id": _id(mid), "title": macro.get("title"), "active": macro.get("active"),
+                "restriction": restriction,
+                "shared": restriction is None or restriction["type"] != "User",
+                "created_at": macro.get("created_at"), "updated_at": macro.get("updated_at"),
+                "usage_30d": macro.get("usage_30d"), "text": macro_text(macro), "deleted": False,
+            }
+        info["word_spans"] = result.word_spans.get(mid) if mid in used else None
+        rows.append({**info, **{key: row.get(key, empty) for key, empty in MACRO_STATS.items()}})
+    return rows
+
+
+def _audit_diff(use: Use) -> list[dict] | None:
+    """The full diff, with nothing shortened. Words are joined by single spaces."""
+    if not use.diff:
+        return None
+    others = iter(use.diff_macro_ids)
+    steps = []
+    for op, words in use.diff:
+        step = {"op": op, "text": " ".join(words)}
+        if op == "macro":
+            step["macro_id"] = _id(next(others))
+        steps.append(step)
+    return steps
+
+
+def _audit_people(result: Result) -> list[dict]:
+    agents = {u.agent_id for u in result.uses}
+    requesters = {u.requester_id for u in result.uses if u.requester_id}
+    people = []
+    for pid in sorted(agents | requesters, key=lambda p: (_id(p) is None, _id(p) or 0, p)):
+        if _id(pid) is None:
+            continue  # an update with no author
+        user = result.users.get(pid, {})
+        role = "both" if pid in agents and pid in requesters else "agent" if pid in agents else "requester"
+        people.append({"id": _id(pid), "name": user.get("name"), "email": user.get("email"), "role": role})
+    return people
+
+
+def audit_data(result: Result, subdomain: str | None) -> dict:
+    """Everything in the run, for other tools to read. See the README for what it's for."""
+    cov = result.coverage
+    return {
+        "schema_version": AUDIT_SCHEMA_VERSION,
+        "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "since": _time(result.since),
+        "until": _time(result.until),
+        "subdomain": subdomain,
+        "sample": subdomain is None,
+        "coverage": {
+            "tickets": cov.tickets, "read": cov.read, "unread": len(cov.unread), "skipped": len(cov.skipped),
+            "stopped_early": cov.stopped_early, "names_missing": cov.names_missing,
+            "requester_names_missing": cov.requester_names_missing,
+        },
+        "usage_counts_available": any("usage_30d" in m for m in result.all_macros.values()),
+        "macros": _audit_macros(result),
+        "uses": [
+            {
+                "audit_id": u.audit_id, "ticket_id": u.ticket_id, "used_at": _time(u.created_at),
+                "agent_id": _id(u.agent_id), "requester_id": _id(u.requester_id), "macro_id": _id(u.macro_id),
+                "comment_type": u.comment_type, "status": u.status, "pct_of_macro": u.pct_of_macro,
+                "added_text": u.added_text, "combined_with": [_id(o) for o in u.combined_with_ids],
+                "diff": _audit_diff(u),
+            }
+            for u in result.uses
+        ],
+        "people": _audit_people(result),
+    }
 
 
 # ---- HTML pieces ---------------------------------------------------------------

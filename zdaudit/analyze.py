@@ -45,6 +45,9 @@ class Use:
     combined_with: list[str] = field(default_factory=list)
     diff: list[tuple[str, list[str]]] | None = None
     added_text: bool = False     # kept intact, with the agent's own text around it
+    combined_with_ids: list[str] = field(default_factory=list)  # the IDs of the macros in combined_with
+    diff_macro_ids: list[str] = field(default_factory=list)     # the macro behind each ("macro", [title]) step of diff
+    requester_id: str | None = None
 
 
 @dataclass
@@ -57,6 +60,8 @@ class Result:
     agents: list[dict]
     macros: list[dict]
     coverage: Coverage = field(default_factory=Coverage)
+    all_macros: dict[str, dict] = field(default_factory=dict)  # every macro fetched, used or not
+    word_spans: dict[str, list | None] = field(default_factory=dict)  # per compared macro, see compile_macro
 
 
 def macro_text(macro: dict) -> str | None:
@@ -81,8 +86,11 @@ def agent_name(users: dict[str, dict], agent_id: str) -> str:
 
 def analyze(audits: list[dict], macros: dict[str, dict], users: dict[str, dict],
             dynamic: dict[str, list[str]], since: datetime, until: datetime,
-            coverage: Coverage | None = None) -> Result:
-    texts = {mid: macro_text(m) for mid, m in macros.items()}
+            coverage: Coverage | None = None, requesters: dict[int, str] | None = None) -> Result:
+    requesters = requesters or {}
+    # `macros` can hold every macro in the account. Only the used ones are compared.
+    used = {str(e["macro_id"]) for a in audits for e in a["events"] if is_macro_event(e)}
+    texts = {mid: macro_text(m) for mid, m in macros.items() if mid in used}
     compiled = {mid: compile_macro(text, dynamic) for mid, text in texts.items() if text}
     uses: list[Use] = []
 
@@ -113,6 +121,7 @@ def analyze(audits: list[dict], macros: dict[str, dict], users: dict[str, dict],
 
         for mid in ref_ids:
             pct_of_macro = diff = None
+            diff_macro_ids: list[str] = []
             if mid not in macros:
                 status = "unavailable"
             elif not texts[mid]:
@@ -127,7 +136,7 @@ def analyze(audits: list[dict], macros: dict[str, dict], users: dict[str, dict],
             else:
                 result = results[mid]
                 pct_of_macro = result.pct_of_macro
-                diff = _name_other_macros(result.diff, [titles[o] for o in to_compare])
+                diff, diff_macro_ids = _name_other_macros(result.diff, to_compare, titles)
                 updated_at = macros[mid].get("updated_at")
                 if result.intact:
                     status = "unedited"
@@ -148,18 +157,26 @@ def analyze(audits: list[dict], macros: dict[str, dict], users: dict[str, dict],
                 combined_with=[titles[o] for o in ref_ids if o != mid],
                 diff=diff,
                 added_text=status == "unedited" and added_text,
+                combined_with_ids=[o for o in ref_ids if o != mid],
+                diff_macro_ids=diff_macro_ids,
+                requester_id=requesters.get(audit["ticket_id"]),
             ))
 
     return Result(since, until, uses, users, _overall(uses), _by_agent(uses, users), _by_macro(uses, macros),
-                  coverage or Coverage())
+                  coverage or Coverage(), macros, {mid: m.word_spans for mid, m in compiled.items()})
 
 
-def _name_other_macros(diff: list[tuple[str, list[str]]] | None,
-                       titles: list[str]) -> list[tuple[str, list[str]]] | None:
-    """Turn each marker for another macro's text into a ("macro", [title]) step of the diff."""
+def _name_other_macros(diff: list[tuple[str, list[str]]] | None, compared: list[str],
+                       titles: dict[str, str]) -> tuple[list[tuple[str, list[str]]] | None, list[str]]:
+    """Turn each marker for another macro's text into a ("macro", [title]) step of the diff.
+
+    `compared` lists the macro IDs in the order given to compare(). Also returns
+    the ID behind each "macro" step, in order.
+    """
     if diff is None:
-        return None
+        return None, []
     named: list[tuple[str, list[str]]] = []
+    ids: list[str] = []
     for op, words in diff:
         run: list[str] = []
         for word in words:
@@ -170,10 +187,11 @@ def _name_other_macros(diff: list[tuple[str, list[str]]] | None,
             if run:
                 named.append((op, run))
                 run = []
-            named.append(("macro", [titles[other]]))
+            named.append(("macro", [titles[compared[other]]]))
+            ids.append(compared[other])
         if run:
             named.append((op, run))
-    return named
+    return named, ids
 
 
 def _pct(part: int, whole: int) -> float | None:

@@ -170,7 +170,7 @@ def print_summary(result: analyze.Result, paths: dict[str, Path]) -> None:
         print("\nWarning: Zendesk stopped answering while the tool was fetching agent names, so agents without "
               "a name are shown by ID.")
     print(f"\nReport: {paths['report']}")
-    print(f"CSVs:   {paths['uses'].parent}")
+    print(f"Files:  {paths['uses'].parent}")
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -71,6 +71,7 @@ class Coverage:
     stopped_early: bool = False                       # Zendesk stopped answering, so the run gave up
     names_missing: bool = False                       # some or all agent names couldn't be fetched
     skipped: list[int] = field(default_factory=list)  # tickets deleted or hidden from this sign-in (403 or 404)
+    requester_names_missing: bool = False             # some or all requester names couldn't be fetched
 
     @property
     def read(self) -> int:
@@ -436,18 +437,19 @@ def _slim_audit(audit: dict) -> dict:
     }
 
 
-def fetch_updated_ticket_ids(zd: Zendesk, since: datetime, log: Callable[[str], None]) -> list[int]:
-    """Every ticket updated since `since`, from the incremental ticket export."""
+def fetch_updated_tickets(zd: Zendesk, since: datetime, log: Callable[[str], None]) -> dict[int, str | None]:
+    """Every ticket updated since `since`, from the incremental ticket export, mapped to its requester's ID."""
     url: str | None = f"/api/v2/incremental/tickets/cursor?start_time={int(since.timestamp())}"
-    ids: dict[int, None] = {}  # a dict keeps order and drops tickets listed twice
+    tickets: dict[int, str | None] = {}  # a dict keeps order and drops tickets listed twice
     while url:
         data = zd.get(url)
         for ticket in data.get("tickets", []):
             if ticket.get("status") != "deleted":
-                ids[ticket["id"]] = None
-        log(f"  Found {len(ids):,} tickets updated since {since:%Y-%m-%d}...")
+                requester = ticket.get("requester_id")
+                tickets[ticket["id"]] = None if requester is None else str(requester)
+        log(f"  Found {len(tickets):,} tickets updated since {since:%Y-%m-%d}...")
         url = None if data.get("end_of_stream") else data.get("after_url")
-    return list(ids)
+    return tickets
 
 
 def fetch_ticket_macro_audits(zd: Zendesk, ticket_id: int, since: datetime) -> list[dict] | None:
@@ -466,13 +468,14 @@ def fetch_ticket_macro_audits(zd: Zendesk, ticket_id: int, since: datetime) -> l
     return kept
 
 
-def fetch_macro_audits(zd: Zendesk, since: datetime, log: Callable[[str], None],
-                       workers: int = 4) -> tuple[list[dict], Coverage]:
+def fetch_macro_audits(zd: Zendesk, since: datetime, log: Callable[[str], None], workers: int = 4,
+                       tickets: Iterable[int] | None = None) -> tuple[list[dict], Coverage]:
     """Macro audits from every updated ticket, and which tickets couldn't be read or were skipped.
 
+    Reads `tickets` when given, or else every ticket updated since `since`.
     Stops early if Zendesk hasn't answered for GIVE_UP_STREAK tickets in a row.
     """
-    ticket_ids = fetch_updated_ticket_ids(zd, since, log)
+    ticket_ids = list(fetch_updated_tickets(zd, since, log) if tickets is None else tickets)
     log(f"Reading the history of {len(ticket_ids):,} tickets...")
     audits: list[dict] = []
     read: set[int] = set()
@@ -537,7 +540,12 @@ def fetch_macro_audits(zd: Zendesk, since: datetime, log: Callable[[str], None],
 
 
 def fetch_macros(zd: Zendesk, wanted: Iterable[str], log: Callable[[str], None]) -> dict[str, dict]:
-    """The macros that were used, with Zendesk's own 30-day usage count when the plan allows it."""
+    """Every macro in the account, with Zendesk's own 30-day usage count when the plan allows it.
+
+    Without an `active` filter the list has active and inactive macros. For an
+    admin it also has every agent's personal macros. Used macros missing from
+    the list, usually because they were deleted, are fetched one by one.
+    """
     wanted = set(wanted)
     path = "/api/v2/macros.json?page%5Bsize%5D=100"
     try:
@@ -547,7 +555,7 @@ def fetch_macros(zd: Zendesk, wanted: Iterable[str], log: Callable[[str], None])
             raise
         log("  Zendesk's macro usage counts aren't available on this plan. Skipping that check.")
         listed = list(zd.paginate(path, "macros"))
-    macros = {str(m["id"]): m for m in listed if str(m["id"]) in wanted}
+    macros = {str(m["id"]): m for m in listed}
     # Macros deleted since they were used won't be in the list. Try each one directly.
     for macro_id in sorted(wanted - macros.keys()):
         try:
@@ -601,14 +609,15 @@ def fetch_users(zd: Zendesk, ids: Iterable[str]) -> tuple[dict[str, dict], bool]
 def fetch_all(zd: Zendesk, since: datetime, log: Callable[[str], None] = print, workers: int = 4) -> dict:
     """Everything the analysis needs. Raises ZendeskError when too little was read for a report."""
     log("Finding tickets updated in this period...")
-    audits, coverage = fetch_macro_audits(zd, since, log, workers)
+    tickets = fetch_updated_tickets(zd, since, log)
+    audits, coverage = fetch_macro_audits(zd, since, log, workers, tickets)
     if coverage.tickets and not coverage.read:
         raise ZendeskError(f"Zendesk kept failing, so none of the {coverage.tickets:,} tickets could be read and "
                            "there's no report. A later run should pick everything up.")
     if coverage.stopped_early:
         log(f"Read {coverage.read:,} of {coverage.tickets:,} tickets. Fetching what the report needs for those...")
     macro_ids = {str(e["macro_id"]) for a in audits for e in a["events"] if is_macro_event(e)}
-    log(f"Fetching {len(macro_ids):,} macros...")
+    log(f"Fetching macros, {len(macro_ids):,} of them used...")
     try:
         macros = fetch_macros(zd, macro_ids, log)
     except ZendeskError as exc:
@@ -618,7 +627,9 @@ def fetch_all(zd: Zendesk, since: datetime, log: Callable[[str], None] = print, 
                            f"{coverage.read:,} of {coverage.tickets:,} tickets were read, but the report needs "
                            "the macros' text. A later run should pick everything up.") from exc
     dynamic: dict[str, list[str]] = {}
-    if any(re.search(r"\{\{-?\s*dc\.", json.dumps(m.get("actions", []))) for m in macros.values()):
+    # Only used macros are compared, so only their placeholders matter.
+    if any(re.search(r"\{\{-?\s*dc\.", json.dumps(macros[mid].get("actions", [])))
+           for mid in macro_ids if mid in macros):
         log("Fetching dynamic content used in macros...")
         dynamic = fetch_dynamic_content(zd, log)
     log("Fetching agent names...")
@@ -626,4 +637,17 @@ def fetch_all(zd: Zendesk, since: datetime, log: Callable[[str], None] = print, 
     if not complete:
         log("  Zendesk stopped answering, so agents without a name are shown by ID.")
         coverage.names_missing = True
-    return {"audits": audits, "macros": macros, "users": users, "dynamic": dynamic, "coverage": coverage}
+    # Requesters of tickets with a macro use, so a later tool can find and remove their names in the text.
+    requester_ids = {tickets.get(a["ticket_id"]) for a in audits} - {None} - users.keys()
+    if requester_ids and not complete:
+        coverage.requester_names_missing = True  # Zendesk already stopped answering, so don't wait on it again
+    elif requester_ids:
+        log("Fetching requester names...")
+        found, complete = fetch_users(zd, requester_ids)
+        users.update(found)
+        if not complete:
+            log("  Zendesk stopped answering, so some requester names are missing from audit.json.")
+            coverage.requester_names_missing = True
+    requesters = {tid: rid for tid, rid in tickets.items() if rid is not None}
+    return {"audits": audits, "macros": macros, "users": users, "dynamic": dynamic, "coverage": coverage,
+            "requesters": requesters}
