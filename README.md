@@ -21,7 +21,7 @@ The report covers:
 
 Here's the top of a report made from the tool's sample data. Below this part, the full report goes on to list agents, every single use with its changes, and the uses that couldn't be compared. In the report, hover over any underlined label to see what it means.
 
-![The top of a macro edit report. It shows 447 macro uses, 12% sent edited, 88% kept intact, and 83% of agents editing, then lists which macros are edited most often and kept intact most often, a breakdown by public reply and internal note, and a table of every macro.](docs/report.png)
+![The top of a macro edit report. It shows 473 macro uses, 16% sent edited, 84% kept intact, and 83% of agents editing, then lists which macros are edited most often and kept intact most often, a breakdown by public reply and internal note, and a table of every macro.](docs/report.png)
 
 It runs on macOS with Python 3.9 or newer. There's nothing to install.
 
