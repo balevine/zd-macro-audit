@@ -8,17 +8,7 @@ It looks at the last 30 days of ticket updates in your Zendesk account, up to th
 - **macro_uses.csv**, one row per macro use (who, which macro, public or internal, edited or not, percent of the macro edited)
 - **macros.csv**, totals per macro
 - **agents.csv**, totals per agent
-- **audit.json**, everything above in one file for other tools to read
-
-### audit.json
-
-`audit.json` is for tools that suggest changes to macros, list unused macros to delete, or remove personal details before sending text anywhere else. It lists every macro in the account, including inactive and personal ones and those nobody used, with its full text. It also lists every use with the full set of changes the agent made, and the names and emails of the agents and the customers who asked for help on those tickets.
-
-**It contains personal data**, such as customer names, emails, and the text of replies. Only your user account on this computer can open it. Don't share it or upload it anywhere until those details are removed.
-
-In a diff, `op` is `equal`, `delete`, `insert`, or `macro`. A `macro` step is the text of another macro applied in the same update, named by `macro_id`. Words are joined by single spaces, so line breaks aren't kept.
-
-Diff words come from a cleaned-up copy of the macro's text, so they don't always match `text` exactly. To find them in `text`, each macro has `word_spans`, with one `[start, end]` per word in its `equal` and `delete` steps, in order. These are Python string positions in `text`, with the end left out. An entry is `null` when the word has no single place in `text`, such as a Liquid block like `{%if…%}` or words from dynamic content. The whole field is `null` for macros with no text, macros not used in the period, and macros whose words couldn't be matched to `text` reliably.
+- **audit.json**, everything above plus every macro in the account, in one file for other tools to read. It contains customer names and emails. See [audit.json](#auditjson) below.
 
 The report covers:
 
@@ -221,6 +211,131 @@ Some uses can't be judged, so they're left out of the percentages and listed sep
 - **Macro deleted or unreadable.** The macro no longer exists, so its text is unknown.
 - **Macro changed since use.** Zendesk only gives the current version of a macro. If someone edited the macro during the period, older uses that don't match it can't be judged.
 
+## audit.json
+
+`audit.json` is for other tools, such as one that suggests edits to macros or lists unused macros to turn off. It lists every macro in the account, including inactive and personal ones and those nobody used. It also lists every use with the full set of changes the agent made, and the names and emails of the agents and customers involved.
+
+**It contains personal data**, such as customer names, emails, and the text of replies. Only your user account on this computer can open it. Don't share it or upload it anywhere until those details are removed. The `people` list helps a tool find the most obvious names, but it doesn't hold everyone a reply might mention, such as people copied on the ticket, other agents, or a nickname. Read any text before you share it.
+
+All times are ISO 8601. IDs are Zendesk's numeric IDs. A value is `null` when it's unknown or doesn't apply.
+
+### Top level
+
+| Field | What it is |
+| --- | --- |
+| `schema_version` | `1`. It goes up when a field is renamed, removed, or changes meaning. A tool should stop on a version it doesn't know. |
+| `generated_at` | When the file was written, in local time with its offset. |
+| `since`, `until` | The period covered, in UTC. |
+| `subdomain` | The Zendesk subdomain, or `null` for `--sample`. |
+| `sample` | `true` when the data is made up by `--sample`. |
+| `usage_counts_available` | `true` when Zendesk's own 30-day usage counts were available. They need the Support Professional plan or higher. |
+| `coverage` | How much of the account was read. See below. |
+| `macros` | Every macro. See below. |
+| `uses` | Every macro use in the period. See below. |
+| `people` | The agents and requesters behind those uses. See below. |
+
+### coverage
+
+| Field | What it is |
+| --- | --- |
+| `tickets` | Tickets updated in the period. |
+| `read` | Tickets whose history was read, including skipped ones. |
+| `unread` | Tickets that couldn't be read because Zendesk kept failing. |
+| `skipped` | Tickets that were deleted or hidden from this sign-in. |
+| `stopped_early` | `true` when Zendesk stopped answering and the run gave up on the rest. |
+| `names_missing` | `true` when some agent names couldn't be fetched. |
+| `requester_names_missing` | `true` when some requester names couldn't be fetched. |
+
+If any of `unread`, `skipped`, or `stopped_early` is set, some uses may be missing. With `--sample`, the ticket counts are all 0.
+
+### macros
+
+One entry per macro, sorted by ID. Macros that were used but couldn't be fetched, because they were deleted or this sign-in can't read them, are included with `deleted` set to `true` and most other fields `null`.
+
+| Field | What it is |
+| --- | --- |
+| `id`, `title` | The macro's ID and title. |
+| `active` | Whether the macro is active. |
+| `restriction` | Who can use it, as `{"type": "Group" or "User", "ids": [...]}`, or `null` for everyone. |
+| `shared` | `false` for a personal macro (restricted to a user), otherwise `true`. |
+| `created_at`, `updated_at` | When the macro was created and last changed. |
+| `usage_30d` | Zendesk's own count of uses in the last 30 days, or `null` when it isn't available. |
+| `text` | The comment text the macro inserts, or `null` if it adds no comment. See the note below. |
+| `deleted` | `true` when the macro was used but couldn't be fetched. |
+| `word_spans` | Where each diff word sits in `text`. See [Finding diff words in the text](#finding-diff-words-in-the-text). |
+| `uses` | Uses in the period. |
+| `compared`, `edited`, `unedited` | Uses that could be judged, and how many of them were edited or kept intact. |
+| `pct_uses_edited` | Share of compared uses that were edited, from 0 to 100. |
+| `avg_pct_of_macro` | Average [percent of the macro edited](#how-much-of-a-macro-was-edited) over compared uses. |
+| `avg_pct_of_macro_when_edited` | The same, over edited uses only. |
+| `public`, `internal` | Uses saved as a public reply or an internal note. Uses saved with no comment are in neither. |
+
+For a macro written in the rich text editor, `text` is a plain text copy of it. Bold, links, and other formatting are left out, but line breaks are kept. Text built from `text` can't be pasted back into such a macro without losing that formatting.
+
+### uses
+
+One entry per macro use, in the order they happened. When an agent applied several macros in one update, each macro gets its own entry with the same `audit_id`.
+
+| Field | What it is |
+| --- | --- |
+| `audit_id`, `ticket_id` | The Zendesk ticket update and ticket. |
+| `used_at` | When the update was saved, in UTC. |
+| `agent_id` | Who saved the update. |
+| `requester_id` | Who asked for help on the ticket. |
+| `macro_id` | The macro used. |
+| `comment_type` | `public`, `internal`, or an empty string when the update was saved with no comment. |
+| `status` | How the use was judged. See below. |
+| `pct_of_macro` | [Percent of the macro edited](#how-much-of-a-macro-was-edited), from 0 to 100. |
+| `added_text` | `true` when the macro was kept intact with the agent's own text around it. |
+| `combined_with` | IDs of the other macros applied in the same update. |
+| `diff` | The agent's changes. See below. |
+
+`status` is one of these. Only `edited` and `unedited` count toward the totals, as described in [Uses that aren't counted](#uses-that-arent-counted).
+
+| `status` | Meaning |
+| --- | --- |
+| `unedited` | Kept intact. |
+| `edited` | Edited. |
+| `changed` | Doesn't match, but the macro was changed after this use, so it can't be judged. Its `diff` compares the reply with the macro's current text, not the text the agent saw. |
+| `no_text` | The macro adds no comment. |
+| `only_placeholders` | The macro's text is all placeholders, so any comment could match it. |
+| `unavailable` | The macro was deleted or this sign-in can't read it. |
+
+### Diffs
+
+A `diff` is a list of steps, each `{"op": ..., "text": ...}`, that walk through the macro and the saved comment in order. It's `null` when the use couldn't be compared.
+
+| `op` | Meaning |
+| --- | --- |
+| `equal` | Macro words the agent kept. |
+| `delete` | Macro words the agent removed. |
+| `insert` | Words the agent added. Inserts before the first `equal` or `delete` step, or after the last, are text added around the macro, such as a greeting or signature. |
+| `macro` | Text from another macro applied in the same update. `text` is that macro's title, and `macro_id` is its ID. |
+
+Words in `text` are joined by single spaces, so line breaks aren't kept. Placeholders show as written in the macro, minus any spaces inside them, such as `{{ticket.requester.first_name}}`. A value Zendesk filled in shows as a `delete` of the placeholder followed by an `insert` of the value. A Liquid block such as `{% if %}` or `{% for %}` shows as a single word like `{%if…%}`. Dynamic content shows as the text of its first version, or as the placeholder if it couldn't be read.
+
+The words of the `equal` and `delete` steps, in order, are always the macro's own words, and they're the same for every use of that macro. That lets a tool give each change a word position in the macro.
+
+If the update was saved with no comment, the diff is one `delete` step with the whole macro.
+
+### Finding diff words in the text
+
+Diff words come from a cleaned-up copy of the macro's text, so they don't always match `text` exactly. For example, `**Save**` in `text` is `Save` in a diff, and `&amp;` is `&`.
+
+To find them in `text`, each macro has `word_spans`, with one `[start, end]` per word in its `equal` and `delete` steps, in order. These are Python string positions in `text`, with the end left out, and they never go backwards. An entry is `null` when the word has no single place in `text` that's safe to replace. That happens with a Liquid block, words from dynamic content, and words with formatting inside them, such as `**Save**.`.
+
+The whole field is `null` for macros with no text, macros not used in the period, and macros whose words couldn't be matched to `text` reliably.
+
+### people
+
+One entry per agent or requester in `uses`, sorted by ID.
+
+| Field | What it is |
+| --- | --- |
+| `id` | The Zendesk user ID. |
+| `name`, `email` | The person's name and email, or `null` when Zendesk didn't return them. |
+| `role` | `agent`, `requester`, or `both`. |
+
 ## Privacy and access
 
 - The tool only reads from Zendesk. It never changes anything in your account.
@@ -238,7 +353,7 @@ Some uses can't be judged, so they're left out of the percentages and listed sep
 | `zdaudit/keychain.py` | Saves and reads secrets in the macOS keychain. |
 | `zdaudit/compare.py` | Works out which words of a comment came from which macro, and measures how much of it was edited. |
 | `zdaudit/analyze.py` | Turns raw data into per-use results and totals. |
-| `zdaudit/report.py` | Writes the HTML report and CSV files. |
+| `zdaudit/report.py` | Writes the HTML report, CSV files, and `audit.json`. |
 | `zdaudit/assets/` | The report's styles and script, which are copied into each report. |
 | `zdaudit/sample.py` | The made-up data behind `--sample`. |
 | `tests/` | Tests. Run them with `python3 -m unittest`. |
